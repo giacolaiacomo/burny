@@ -1,21 +1,86 @@
-// AI Usage Bar — menu bar widget with Claude Code and Codex (ChatGPT) usage limits.
-// The app itself makes no network calls and never touches credentials:
-//   Claude Code: runs the official `claude -p /usage` (0 tokens, the same request as typing /usage)
+// Headroom — a tiny macOS menu bar app showing your Claude Code and Codex (ChatGPT) plan limits.
+//
+// It makes no network calls of its own and never touches credentials:
+//   Claude Code: runs the official `claude -p /usage` (0 tokens — the same request as typing /usage)
 //   Codex:       reads the rate_limits the Codex CLI already logs in ~/.codex/sessions/**/rollout-*.jsonl
 
 import AppKit
 import SwiftUI
 import Combine
 
+let bundleID = "com.headroom.menubar"
+
+// MARK: Localization (English + Italian; add a language by adding a table)
+
+var lang = "en"
+
+func resolveLanguage(_ pref: String) -> String {
+    pref != "system" ? pref : (Locale.preferredLanguages.first?.hasPrefix("it") == true ? "it" : "en")
+}
+
+let italian: [String: String] = [
+    "Usage limits": "Limiti di utilizzo",
+    "Settings": "Impostazioni",
+    "Refresh now": "Aggiorna ora",
+    "The tick on each bar shows where you'd be at an even pace.": "La tacca sulla barra indica dove saresti a ritmo costante.",
+    "Local data and official clients only": "Solo dati locali e client ufficiali",
+    "Quit": "Esci",
+    "No data yet — use it once and it will show up here.": "Nessun dato: usalo una volta e comparirà qui.",
+    "Session": "Sessione",
+    "Week": "Settimana",
+    "all models": "tutti i modelli",
+    "Window": "Finestra",
+    "Reset": "Azzerato",
+    "Resets in %@ · %@": "Si azzera tra %@ · %@",
+    "tomorrow": "domani",
+    "d": "g",
+    "just now": "adesso",
+    "%d min ago": "%d min fa",
+    "%d h ago": "%d h fa",
+    "%d d ago": "%d g fa",
+    "General": "Generale",
+    "Open at login": "Apri al login",
+    "Language": "Lingua",
+    "System": "Sistema",
+    "Menu bar": "Barra dei menu",
+    "Limit shown": "Limite mostrato",
+    "The one closest to running out, session or week.": "Quello più vicino all'esaurimento, tra sessione e settimana.",
+    "Most critical": "Più critico",
+    "5h session": "Sessione 5h",
+    "Percentage": "Percentuale",
+    "Used": "Usata",
+    "Left": "Rimasta",
+    "Refresh": "Aggiornamento",
+    "Claude every": "Claude ogni",
+    "Runs the official /usage: 0 tokens. Codex is read from local logs every 30 s.":
+        "Esegue /usage del client ufficiale: 0 token. Codex si legge dai log locali ogni 30 s.",
+]
+
+func tr(_ s: String) -> String { lang == "it" ? italian[s] ?? s : s }
+
 // MARK: Model
 
+enum Kind: Hashable {
+    case session(hours: Int)
+    case week(model: String?)   // nil = all models
+    case other(hours: Int)
+}
+
 struct Limit: Identifiable {
-    let label: String
+    let kind: Kind
     let percent: Double        // 0...100
     let resetsAt: Date?
     let window: TimeInterval   // window length, for the pace marker
-    var id: String { label }
+    var id: Kind { kind }
 
+    var label: String {
+        switch kind {
+        case .session(let h): return "\(tr("Session")) · \(h)h"
+        case .week(nil): return tr("Week")
+        case .week(let m?): return "\(tr("Week")) · \(m == "all models" ? tr(m) : m)"
+        case .other(let h): return "\(tr("Window")) \(h)h"
+        }
+    }
     var effective: Double {    // a window whose reset has passed is empty again
         if let r = resetsAt, r < Date() { return 0 }
         return percent
@@ -29,7 +94,6 @@ struct Limit: Identifiable {
 struct Service {
     let name: String
     let plan: String?
-    let accent: Color
     let limits: [Limit]
     let updated: Date?
 }
@@ -58,10 +122,11 @@ func claudeBinary() -> String? {
 
 func fetchClaudeUsage() -> [Limit]? {
     guard let bin = claudeBinary() else { return nil }
-    let cwd = home.appendingPathComponent("Library/Caches/ai-usage-bar")
+    let cwd = home.appendingPathComponent("Library/Caches/Headroom")
     try? FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
     let p = Process()
     p.executableURL = URL(fileURLWithPath: bin)
+    // No hooks, no saved session, only the user's own settings: nothing but the /usage request.
     p.arguments = ["-p", "/usage", "--output-format", "json", "--no-session-persistence",
                    "--setting-sources", "user", "--settings", "{\"disableAllHooks\":true}"]
     p.currentDirectoryURL = cwd
@@ -92,10 +157,9 @@ func parseUsage(_ text: String) -> [Limit] {
         func g(_ i: Int) -> String? { m.range(at: i).location == NSNotFound ? nil : ns.substring(with: m.range(at: i)) }
         guard let pct = g(3).flatMap(Double.init) else { return nil }
         let isSession = g(1) == "session"
-        let bucket = g(2) ?? ""
-        let label = isSession ? "Sessione · 5h" : "Settimana · " + (bucket == "all models" ? "tutti i modelli" : bucket)
         let reset = g(4).flatMap { parseReset($0, tz: g(5)) }
-        return Limit(label: label, percent: pct, resetsAt: reset, window: isSession ? 5 * hour : week)
+        return Limit(kind: isSession ? .session(hours: 5) : .week(model: g(2)), percent: pct, resetsAt: reset,
+                     window: isSession ? 5 * hour : week)
     }
 }
 
@@ -129,35 +193,80 @@ func claudePlan() -> String? {
 }
 
 // MARK: Codex
+//
+// Sessions live in ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl and can be tens of MB. To stay light we
+// only list the newest day folders, re-read a file only when it changes, and scan it backwards in
+// small chunks for the last line carrying rate_limits — no whole-file reads, no big strings.
+
+private var codexCache: (url: URL, mtime: Date, service: Service?)?
+
+func recentCodexFiles() -> [(URL, Date)] {
+    let fm = FileManager.default
+    func subdirs(_ u: URL) -> [URL] {
+        ((try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: [.isDirectoryKey])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+    }
+    var days: [URL] = []
+    outer: for y in subdirs(home.appendingPathComponent(".codex/sessions")) {
+        for m in subdirs(y) { for d in subdirs(m) { days.append(d); if days.count >= 7 { break outer } } }
+    }
+    let files = days.flatMap { (try? fm.contentsOfDirectory(at: $0, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] }
+    return files.filter { $0.pathExtension == "jsonl" }.map { ($0, mtime($0)) }.sorted { $0.1 > $1.1 }
+}
+
+/// The last JSON line in `url` that carries rate_limits, reading backwards 256 KB at a time (max 8 MB).
+func lastRateLimitLine(_ url: URL) -> [String: Any]? {
+    guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? h.close() }
+    let needle = Data("\"primary\":{".utf8), chunk: UInt64 = 256 * 1024
+    let size = (try? h.seekToEnd()) ?? 0
+    var offset = size, buf = Data(), searchEnd = 0
+    func parse(_ d: Data) -> [String: Any]? {
+        guard let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              (obj["payload"] as? [String: Any])?["rate_limits"] != nil else { return nil }
+        return obj
+    }
+    while offset > 0 && size - offset < 8 * 1024 * 1024 {
+        let start = offset > chunk ? offset - chunk : 0
+        try? h.seek(toOffset: start)
+        guard let part = try? h.read(upToCount: Int(offset - start)) else { return nil }
+        buf = part + buf
+        searchEnd += part.count
+        offset = start
+        while let r = buf.range(of: needle, options: .backwards, in: 0..<searchEnd) {
+            guard let nl = buf[..<r.lowerBound].lastIndex(of: 10) else {
+                if offset == 0, let end = buf.firstIndex(of: 10) { return parse(buf[..<end]) }   // first line of the file
+                break                                                                            // line began in an earlier chunk
+            }
+            let end = buf[r.upperBound...].firstIndex(of: 10) ?? buf.endIndex
+            if let obj = parse(buf[(nl + 1)..<end]) { return obj }
+            searchEnd = nl
+        }
+        buf = Data(buf[..<min(buf.count, searchEnd + 64 * 1024)])   // drop the already-searched tail, keep a margin
+    }
+    return nil
+}
 
 func readCodex() -> Service? {
-    let root = home.appendingPathComponent(".codex/sessions")
-    guard let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return nil }
-    var files: [(URL, Date)] = []
-    for case let u as URL in en where u.pathExtension == "jsonl" { files.append((u, mtime(u))) }
-    files.sort { $0.1 > $1.1 }
-    let iso = ISO8601DateFormatter()
-    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let files = recentCodexFiles()
+    if let newest = files.first, let c = codexCache, c.url == newest.0, c.mtime == newest.1 { return c.service }
     for (f, mt) in files.prefix(10) {
-        guard let h = try? FileHandle(forReadingFrom: f) else { continue }
-        defer { try? h.close() }
-        let size = (try? h.seekToEnd()) ?? 0
-        try? h.seek(toOffset: size > 4_000_000 ? size - 4_000_000 : 0)   // only the tail matters
-        guard let data = try? h.readToEnd(), let text = String(data: data, encoding: .utf8) else { continue }
-        for line in text.split(separator: "\n").reversed() where line.contains("\"primary\":{") {
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let payload = obj["payload"] as? [String: Any],
-                  let rl = payload["rate_limits"] as? [String: Any] else { continue }
-            func lim(_ k: String) -> Limit? {
-                guard let d = rl[k] as? [String: Any], let p = (d["used_percent"] as? NSNumber)?.doubleValue else { return nil }
-                let mins = (d["window_minutes"] as? NSNumber)?.doubleValue ?? 0
-                let label = mins >= 10080 ? "Settimana" : mins > 0 && mins < 1440 ? "Sessione · \(Int(mins / 60))h" : "Finestra \(Int(mins / 60))h"
-                return Limit(label: label, percent: p, resetsAt: epoch(d["resets_at"]), window: mins * 60)
-            }
-            let ts = (obj["timestamp"] as? String).flatMap { iso.date(from: $0) } ?? mt
-            return Service(name: "Codex", plan: (rl["plan_type"] as? String)?.capitalized, accent: codexAccent,
-                           limits: [lim("primary"), lim("secondary")].compactMap { $0 }, updated: ts)
+        guard let obj = autoreleasepool(invoking: { lastRateLimitLine(f) }),
+              let rl = (obj["payload"] as? [String: Any])?["rate_limits"] as? [String: Any] else { continue }
+        func lim(_ k: String) -> Limit? {
+            guard let d = rl[k] as? [String: Any], let p = (d["used_percent"] as? NSNumber)?.doubleValue else { return nil }
+            let mins = (d["window_minutes"] as? NSNumber)?.intValue ?? 0
+            let kind: Kind = mins >= 10080 ? .week(model: nil) : mins > 0 && mins < 1440 ? .session(hours: mins / 60) : .other(hours: mins / 60)
+            return Limit(kind: kind, percent: p, resetsAt: epoch(d["resets_at"]), window: Double(mins) * 60)
         }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let ts = (obj["timestamp"] as? String).flatMap { iso.date(from: $0) } ?? mt
+        let service = Service(name: "Codex", plan: (rl["plan_type"] as? String)?.capitalized,
+                              limits: [lim("primary"), lim("secondary")].compactMap { $0 }, updated: ts)
+        if let newest = files.first { codexCache = (newest.0, newest.1, service) }
+        return service
     }
     return nil
 }
@@ -165,7 +274,6 @@ func readCodex() -> Service? {
 // MARK: Open at login (the LaunchAgent written by install.sh)
 
 enum LoginItem {
-    static let label = "com.aiusagebar"
     static var domain: String { "gui/\(getuid())" }
 
     @discardableResult
@@ -182,13 +290,13 @@ enum LoginItem {
     }
 
     static var isEnabled: Bool {
-        let plist = home.appendingPathComponent("Library/LaunchAgents/\(label).plist")
+        let plist = home.appendingPathComponent("Library/LaunchAgents/\(bundleID).plist")
         guard FileManager.default.fileExists(atPath: plist.path) else { return false }
         let disabled = launchctl(["print-disabled", domain])
-        return !disabled.contains("\"\(label)\" => disabled") && !disabled.contains("\"\(label)\" => true")
+        return !disabled.contains("\"\(bundleID)\" => disabled") && !disabled.contains("\"\(bundleID)\" => true")
     }
 
-    static func set(_ on: Bool) { launchctl([on ? "enable" : "disable", "\(domain)/\(label)"]) }
+    static func set(_ on: Bool) { launchctl([on ? "enable" : "disable", "\(domain)/\(bundleID)"]) }
 }
 
 // MARK: Store
@@ -197,41 +305,50 @@ final class Store: ObservableObject {
     @Published var claude: Service?
     @Published var codex: Service?
     @Published var fetching = false
-    @Published var showClaude = UserDefaults.standard.object(forKey: "showClaude") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(showClaude, forKey: "showClaude") }
+
+    private static let defaults = UserDefaults.standard
+    @Published var language = defaults.string(forKey: "language") ?? "system" {   // system | en | it
+        didSet { Self.defaults.set(language, forKey: "language"); lang = resolveLanguage(language) }
     }
-    @Published var showCodex = UserDefaults.standard.object(forKey: "showCodex") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(showCodex, forKey: "showCodex") }
+    @Published var showClaude = defaults.object(forKey: "showClaude") as? Bool ?? true {
+        didSet { Self.defaults.set(showClaude, forKey: "showClaude") }
     }
-    @Published var barMode = UserDefaults.standard.string(forKey: "barMode") ?? "peak" {   // peak | session | week
-        didSet { UserDefaults.standard.set(barMode, forKey: "barMode") }
+    @Published var showCodex = defaults.object(forKey: "showCodex") as? Bool ?? true {
+        didSet { Self.defaults.set(showCodex, forKey: "showCodex") }
     }
-    @Published var showRemaining = UserDefaults.standard.bool(forKey: "showRemaining") {
-        didSet { UserDefaults.standard.set(showRemaining, forKey: "showRemaining") }
+    @Published var barMode = defaults.string(forKey: "barMode") ?? "peak" {   // peak | session | week
+        didSet { Self.defaults.set(barMode, forKey: "barMode") }
     }
-    @Published var refreshMinutes = UserDefaults.standard.object(forKey: "refreshMinutes") as? Int ?? 5 {
-        didSet { UserDefaults.standard.set(refreshMinutes, forKey: "refreshMinutes") }
+    @Published var showRemaining = defaults.bool(forKey: "showRemaining") {
+        didSet { Self.defaults.set(showRemaining, forKey: "showRemaining") }
+    }
+    @Published var refreshMinutes = defaults.object(forKey: "refreshMinutes") as? Int ?? 5 {
+        didSet { Self.defaults.set(refreshMinutes, forKey: "refreshMinutes") }
     }
     @Published var launchAtLogin = LoginItem.isEnabled {
         didSet { if launchAtLogin != oldValue { LoginItem.set(launchAtLogin) } }
     }
 
-    /// The number shown in the menu bar for a service, per the user's choice (always "% used").
+    private var fetched: (limits: [Limit], at: Date)?
+    private var plan: String?
+
+    init() { lang = resolveLanguage(language) }
+
+    /// The % used shown in the menu bar for a service, per the "Limit shown" setting.
     func barValue(_ s: Service?) -> Double? {
         guard let s else { return nil }
-        let pick: [Limit]
-        switch barMode {
-        case "session": pick = s.limits.filter { $0.window <= 5 * hour }
-        case "week": pick = s.limits.filter { $0.window >= week }
-        default: pick = s.limits
+        let pick = s.limits.filter {
+            switch (barMode, $0.kind) {
+            case ("session", .session), ("week", .week), ("peak", _): return true
+            default: return false
+            }
         }
         return pick.map(\.effective).max()
     }
-    private var fetched: (limits: [Limit], at: Date)?
 
     func reloadLocal() {
         codex = readCodex()
-        claude = fetched.map { Service(name: "Claude Code", plan: claudePlan(), accent: claudeAccent, limits: $0.limits, updated: $0.at) }
+        claude = fetched.map { Service(name: "Claude Code", plan: plan, limits: $0.limits, updated: $0.at) }
     }
 
     func fetch(ifOlderThan age: TimeInterval = 0) {
@@ -241,7 +358,7 @@ final class Store: ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             let l = fetchClaudeUsage()
             DispatchQueue.main.async {
-                if let l { self.fetched = (l, Date()) }
+                if let l { self.fetched = (l, Date()); self.plan = claudePlan() }
                 self.fetching = false
                 self.reloadLocal()
             }
@@ -255,19 +372,21 @@ func levelColor(_ p: Double, _ accent: Color) -> Color { p >= 90 ? .red : p >= 7
 
 func resetLine(_ d: Date?) -> String {
     guard let d else { return " " }
-    if d < Date() { return "Azzerato" }
-    let f = DateFormatter()
-    f.locale = Locale(identifier: "it_IT")
-    f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : Calendar.current.isDateInTomorrow(d) ? "'domani' HH:mm" : "EEE d · HH:mm"
+    if d < Date() { return tr("Reset") }
+    let cal = Calendar.current, f = DateFormatter()
+    f.locale = Locale(identifier: lang == "it" ? "it_IT" : "en_US")
+    f.dateFormat = cal.isDateInToday(d) || cal.isDateInTomorrow(d) ? "HH:mm" : "EEE d · HH:mm"
+    let when = (cal.isDateInTomorrow(d) ? tr("tomorrow") + " " : "") + f.string(from: d)
     let m = Int(d.timeIntervalSinceNow / 60)
-    let rel = m < 60 ? "\(m)m" : m < 1440 ? "\(m / 60)h \(m % 60)m" : "\(m / 1440)g \(m % 1440 / 60)h"
-    return "Si azzera tra \(rel) · \(f.string(from: d))"
+    let rel = m < 60 ? "\(m)m" : m < 1440 ? "\(m / 60)h \(m % 60)m" : "\(m / 1440)\(tr("d")) \(m % 1440 / 60)h"
+    return String(format: tr("Resets in %@ · %@"), rel, when)
 }
 
 func ago(_ d: Date?) -> String {
     guard let d else { return "" }
     let m = Int(-d.timeIntervalSinceNow / 60)
-    return m < 1 ? "adesso" : m < 60 ? "\(m) min fa" : m < 1440 ? "\(m / 60) h fa" : "\(m / 1440) g fa"
+    return m < 1 ? tr("just now") : m < 60 ? String(format: tr("%d min ago"), m)
+        : m < 1440 ? String(format: tr("%d h ago"), m / 60) : String(format: tr("%d d ago"), m / 1440)
 }
 
 struct LimitRow: View {
@@ -320,12 +439,11 @@ struct ServiceCard: View {
             if let s = service, !s.limits.isEmpty {
                 ForEach(s.limits) { LimitRow(limit: $0, accent: accent) }
             } else {
-                Text("Nessun dato: usalo una volta e comparirà qui.").font(.system(size: 11.5)).foregroundStyle(.secondary)
+                Text(tr("No data yet — use it once and it will show up here.")).font(.system(size: 11.5)).foregroundStyle(.secondary)
             }
         }
         .padding(14)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.055))
-            .shadow(color: .black.opacity(0.06), radius: 1, y: 0.5))
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.055)))
     }
 }
 
@@ -338,14 +456,14 @@ struct UsageView: View {
                 if settings {
                     Button { settings = false } label: { Image(systemName: "chevron.left") }.buttonStyle(.borderless)
                 }
-                Text(settings ? "Impostazioni" : "Limiti di utilizzo").font(.system(size: 14, weight: .bold))
+                Text(tr(settings ? "Settings" : "Usage limits")).font(.system(size: 14, weight: .bold))
                 Spacer()
                 if !settings {
                     if store.fetching { ProgressView().controlSize(.small).scaleEffect(0.8) }
                     Button { store.fetch() } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.borderless).help("Aggiorna ora")
+                        .buttonStyle(.borderless).help(tr("Refresh now"))
                     Button { settings = true } label: { Image(systemName: "gearshape") }
-                        .buttonStyle(.borderless).help("Impostazioni")
+                        .buttonStyle(.borderless).help(tr("Settings"))
                 }
             }
             if settings {
@@ -353,15 +471,15 @@ struct UsageView: View {
             } else {
                 ServiceCard(service: store.claude, name: "Claude Code", accent: claudeAccent)
                 ServiceCard(service: store.codex, name: "Codex", accent: codexAccent)
-                Text("La tacca sulla barra indica dove saresti a ritmo costante.")
+                Text(tr("The tick on each bar shows where you'd be at an even pace."))
                     .font(.system(size: 10.5)).foregroundStyle(.tertiary)
             }
             Divider()
             HStack {
                 Image(systemName: "lock.shield").font(.system(size: 10))
-                Text("Solo dati locali e client ufficiali").font(.system(size: 10.5))
+                Text(tr("Local data and official clients only")).font(.system(size: 10.5))
                 Spacer()
-                Button("Esci") { NSApp.terminate(nil) }.buttonStyle(.borderless).font(.system(size: 11))
+                Button(tr("Quit")) { NSApp.terminate(nil) }.buttonStyle(.borderless).font(.system(size: 11))
             }
             .foregroundStyle(.tertiary)
         }
@@ -376,7 +494,7 @@ struct SettingsSection<Content: View>: View {
     @ViewBuilder let content: Content
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title.uppercased()).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).padding(.leading, 4)
+            Text(tr(title).uppercased()).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).padding(.leading, 4)
             VStack(alignment: .leading, spacing: 10) { content }
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -392,8 +510,8 @@ struct SettingRow<Control: View>: View {
     var body: some View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(label).font(.system(size: 12))
-                if let note { Text(note).font(.system(size: 10.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                Text(tr(label)).font(.system(size: 12))
+                if let note { Text(tr(note)).font(.system(size: 10.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
             }
             Spacer(minLength: 8)
             control
@@ -405,12 +523,20 @@ struct SettingsView: View {
     @ObservedObject var store: Store
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            SettingsSection(title: "Generale") {
-                SettingRow(label: "Apri al login") {
+            SettingsSection(title: "General") {
+                SettingRow(label: "Open at login") {
                     Toggle("", isOn: $store.launchAtLogin).toggleStyle(.switch).controlSize(.mini).labelsHidden()
                 }
+                SettingRow(label: "Language") {
+                    Picker("", selection: $store.language) {
+                        Text(tr("System")).tag("system")
+                        Text("English").tag("en")
+                        Text("Italiano").tag("it")
+                    }
+                    .labelsHidden().fixedSize()
+                }
             }
-            SettingsSection(title: "Barra dei menu") {
+            SettingsSection(title: "Menu bar") {
                 SettingRow(label: "Claude Code") {
                     Toggle("", isOn: $store.showClaude).toggleStyle(.switch).controlSize(.mini).labelsHidden()
                 }
@@ -418,24 +544,24 @@ struct SettingsView: View {
                     Toggle("", isOn: $store.showCodex).toggleStyle(.switch).controlSize(.mini).labelsHidden()
                 }
                 Divider()
-                SettingRow(label: "Limite mostrato", note: store.barMode == "peak" ? "Quello più vicino all'esaurimento, tra sessione e settimana." : nil) {
+                SettingRow(label: "Limit shown", note: store.barMode == "peak" ? "The one closest to running out, session or week." : nil) {
                     Picker("", selection: $store.barMode) {
-                        Text("Più critico").tag("peak")
-                        Text("Sessione 5h").tag("session")
-                        Text("Settimana").tag("week")
+                        Text(tr("Most critical")).tag("peak")
+                        Text(tr("5h session")).tag("session")
+                        Text(tr("Week")).tag("week")
                     }
                     .labelsHidden().fixedSize()
                 }
-                SettingRow(label: "Percentuale") {
+                SettingRow(label: "Percentage") {
                     Picker("", selection: $store.showRemaining) {
-                        Text("Usata").tag(false)
-                        Text("Rimasta").tag(true)
+                        Text(tr("Used")).tag(false)
+                        Text(tr("Left")).tag(true)
                     }
                     .pickerStyle(.segmented).labelsHidden().fixedSize()
                 }
             }
-            SettingsSection(title: "Aggiornamento") {
-                SettingRow(label: "Claude ogni", note: "Esegue /usage del client ufficiale: 0 token. Codex si legge dai log locali ogni 30 s.") {
+            SettingsSection(title: "Refresh") {
+                SettingRow(label: "Claude every", note: "Runs the official /usage: 0 tokens. Codex is read from local logs every 30 s.") {
                     Picker("", selection: $store.refreshMinutes) {
                         ForEach([2, 5, 10, 15], id: \.self) { Text("\($0) min").tag($0) }
                     }
@@ -446,31 +572,67 @@ struct SettingsView: View {
     }
 }
 
-// MARK: Menu bar
+// MARK: Drawing (menu bar fallback ring, app icon)
 
 func ring(_ p: Double?, _ accent: NSColor) -> NSImage {
-    let size: CGFloat = 14
-    return NSImage(size: NSSize(width: size, height: size), flipped: false) { r in
+    NSImage(size: NSSize(width: 14, height: 14), flipped: false) { r in
         let rect = r.insetBy(dx: 1.75, dy: 1.75)
         let track = NSBezierPath(ovalIn: rect)
         track.lineWidth = 2.5
         NSColor.labelColor.withAlphaComponent(0.22).setStroke()
         track.stroke()
         if let p, p > 0 {
-            let c = p >= 90 ? NSColor.systemRed : p >= 75 ? NSColor.systemOrange : accent
             let arc = NSBezierPath()
             arc.appendArc(withCenter: NSPoint(x: r.midX, y: r.midY), radius: rect.width / 2,
                           startAngle: 90, endAngle: 90 - 360 * CGFloat(min(p, 100)) / 100, clockwise: true)
             arc.lineWidth = 2.5
             arc.lineCapStyle = .round
-            c.setStroke()
+            (p >= 90 ? NSColor.systemRed : p >= 75 ? NSColor.systemOrange : accent).setStroke()
             arc.stroke()
         }
         return true
     }
 }
 
-final class App: NSObject, NSApplicationDelegate {
+/// The app icon: two concentric gauges (Claude orange, Codex green) on a dark squircle.
+func drawAppIcon(px: Int) -> NSBitmapImageRep? {
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8, samplesPerPixel: 4,
+                                     hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+    else { return nil }
+    let s = CGFloat(px)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    let body = NSRect(x: s * 0.1, y: s * 0.1, width: s * 0.8, height: s * 0.8)   // Apple icon grid margin
+    let squircle = NSBezierPath(roundedRect: body, xRadius: s * 0.18, yRadius: s * 0.18)
+    NSGradient(starting: NSColor(red: 0.16, green: 0.18, blue: 0.24, alpha: 1), ending: NSColor(red: 0.07, green: 0.08, blue: 0.11, alpha: 1))?
+        .draw(in: squircle, angle: -90)
+    let c = NSPoint(x: body.midX, y: body.midY - s * 0.01)
+    func gauge(radius: CGFloat, width: CGFloat, fraction: CGFloat, color: NSColor) {
+        let start: CGFloat = 225, sweep: CGFloat = 270   // open at the bottom, like a speedometer
+        let track = NSBezierPath()
+        track.appendArc(withCenter: c, radius: radius, startAngle: start, endAngle: start - sweep, clockwise: true)
+        track.lineWidth = width
+        track.lineCapStyle = .round
+        NSColor.white.withAlphaComponent(0.10).setStroke()
+        track.stroke()
+        let arc = NSBezierPath()
+        arc.appendArc(withCenter: c, radius: radius, startAngle: start, endAngle: start - sweep * fraction, clockwise: true)
+        arc.lineWidth = width
+        arc.lineCapStyle = .round
+        color.setStroke()
+        arc.stroke()
+    }
+    gauge(radius: s * 0.25, width: s * 0.065, fraction: 0.72, color: NSColor(claudeAccent))
+    gauge(radius: s * 0.155, width: s * 0.065, fraction: 0.42, color: NSColor(codexAccent))
+    NSColor.white.withAlphaComponent(0.9).setFill()
+    NSBezierPath(ovalIn: NSRect(x: c.x - s * 0.03, y: c.y - s * 0.03, width: s * 0.06, height: s * 0.06)).fill()
+    NSGraphicsContext.restoreGraphicsState()
+    return rep
+}
+
+// MARK: Menu bar
+
+final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let popover = NSPopover()
     let store = Store()
@@ -479,9 +641,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         popover.behavior = .transient
-        let host = NSHostingController(rootView: UsageView(store: store))
-        host.sizingOptions = [.preferredContentSize]   // grow/shrink with content instead of clipping
-        popover.contentViewController = host
+        popover.delegate = self
         item.button?.target = self
         item.button?.action = #selector(toggle)
         bag = store.objectWillChange.sink { [weak self] in DispatchQueue.main.async { self?.render() } }
@@ -497,8 +657,19 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     // The real app icons make it obvious which number is which; fall back to a coloured ring.
+    // Rasterised once at menu bar size (@2x) so the full 1024 px icon isn't kept around.
     lazy var icons: [NSImage?] = ["/Applications/Claude.app", "/Applications/ChatGPT.app"].map { path in
-        FileManager.default.fileExists(atPath: path) ? NSWorkspace.shared.icon(forFile: path) : nil
+        guard FileManager.default.fileExists(atPath: path),
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 34, pixelsHigh: 34, bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+        else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSWorkspace.shared.icon(forFile: path).draw(in: NSRect(x: 0, y: 0, width: 34, height: 34))
+        NSGraphicsContext.restoreGraphicsState()
+        let img = NSImage(size: NSSize(width: 17, height: 17))
+        img.addRepresentation(rep)
+        return img
     }
 
     func render() {
@@ -510,42 +681,62 @@ final class App: NSObject, NSApplicationDelegate {
             if let s { tip.append(s.name + ": " + s.limits.map { "\($0.label) \(Int($0.effective.rounded()))%" }.joined(separator: ", ")) }
             guard shown[i] else { continue }
             if title.length > 0 { title.append(NSAttributedString(string: "  ", attributes: [.font: font])) }
+            let p = store.barValue(s)   // colour always follows % used
             let att = NSTextAttachment()
-            att.image = icons[i] ?? ring(store.barValue(s), accent)
+            att.image = icons[i] ?? ring(p, accent)
             att.bounds = CGRect(x: 0, y: -4, width: 17, height: 17)
             title.append(NSAttributedString(attachment: att))
-            let p = store.barValue(s)   // colour always follows % used
             let color: NSColor = p.map { $0 >= 90 ? .systemRed : $0 >= 75 ? .systemOrange : .labelColor } ?? .secondaryLabelColor
-            let shownValue = p.map { store.showRemaining ? max(0, 100 - $0) : $0 }
-            title.append(NSAttributedString(string: " " + (shownValue.map { "\(Int($0.rounded()))%" } ?? "–"), attributes: [.font: font, .foregroundColor: color]))
+            let value = p.map { store.showRemaining ? max(0, 100 - $0) : $0 }
+            title.append(NSAttributedString(string: " " + (value.map { "\(Int($0.rounded()))%" } ?? "–"), attributes: [.font: font, .foregroundColor: color]))
         }
         if title.length == 0 {   // both hidden: keep a clickable glyph
             let att = NSTextAttachment()
-            att.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "Limiti AI")
+            att.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "Headroom")
             title.append(NSAttributedString(attachment: att))
         }
         item.button?.attributedTitle = title
         item.button?.toolTip = tip.joined(separator: "\n")
     }
 
+    func popoverDidClose(_ n: Notification) { popover.contentViewController = nil }
+
     @objc func toggle() {
         guard let b = item.button else { return }
         if popover.isShown { popover.performClose(nil); return }
         store.reloadLocal()
         store.fetch(ifOlderThan: 60)
+        // The SwiftUI view is built on open and dropped on close, so it costs no memory while hidden.
+        let host = NSHostingController(rootView: UsageView(store: store))
+        host.sizingOptions = [.preferredContentSize]   // grow/shrink with content instead of clipping
+        popover.contentViewController = host
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
     }
 }
 
-// `AIUsageBar --snapshot out.png [dark] [settings]` renders the popover to a PNG (for checking the design).
-if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count {
+// MARK: Entry point
+//
+// Dev helpers:  --icon out.png [px]                        renders the app icon
+//               --snapshot out.png [dark] [settings] [en|it]  renders the popover with live data
+
+let args = CommandLine.arguments
+func png(_ rep: NSBitmapImageRep, _ path: String) {
+    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+}
+
+if let i = args.firstIndex(of: "--icon"), i + 1 < args.count {
+    if let rep = drawAppIcon(px: i + 2 < args.count ? Int(args[i + 2]) ?? 1024 : 1024) { png(rep, args[i + 1]) }
+    exit(0)
+}
+
+if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
     MainActor.assumeIsolated {
-        let args = CommandLine.arguments
         let store = Store()
+        if args.contains("en") { lang = "en" } else if args.contains("it") { lang = "it" }
         store.reloadLocal()
-        if let l = fetchClaudeUsage() { store.claude = Service(name: "Claude Code", plan: claudePlan(), accent: claudeAccent, limits: l, updated: Date()) }
+        if let l = fetchClaudeUsage() { store.claude = Service(name: "Claude Code", plan: claudePlan(), limits: l, updated: Date()) }
         let host = NSHostingView(rootView: UsageView(store: store, settings: args.contains("settings")))
         host.frame.size = host.fittingSize
         let win = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
@@ -555,7 +746,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLi
         host.display()
         if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
             host.cacheDisplay(in: host.bounds, to: rep)
-            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+            png(rep, args[i + 1])
         }
     }
     exit(0)

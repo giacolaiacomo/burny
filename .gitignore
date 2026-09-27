@@ -1,4 +1,3 @@
-AIUsageBar
-*.png
-!docs/*.png
 .DS_Store
+/headroom
+*.iconset
