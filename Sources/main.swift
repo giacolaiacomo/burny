@@ -12,7 +12,7 @@ import UserNotifications
 
 let bundleID = "com.burny.menubar"
 let repoSlug = "giacolaiacomo/burny"
-let appVersion = "1.1.0"   // install.sh reads this for Info.plist
+let appVersion = "1.2.0"   // install.sh reads this for Info.plist
 
 // MARK: Localization (English + Italian; add a language by adding a table)
 
@@ -55,9 +55,6 @@ let italian: [String: String] = [
     "The one closest to running out, session or week.": "Quello più vicino all'esaurimento, tra sessione e settimana.",
     "Most critical": "Più critico",
     "5h session": "Sessione 5h",
-    "Percentage": "Percentuale",
-    "Used": "Usata",
-    "Left": "Rimasta",
     "Refresh": "Frequenza",
     "Claude every": "Claude ogni",
     "Runs the official /usage: 0 tokens. Codex is read from local logs every 30 s.":
@@ -78,6 +75,17 @@ let italian: [String: String] = [
     "View": "Vedi",
     "You're up to date.": "Sei aggiornato.",
     "Check now": "Controlla ora",
+    "Once per limit and window. Also tells you when a limit past 90% resets.":
+        "Una volta per limite e finestra. Ti avvisa anche quando un limite oltre il 90% si azzera.",
+    "%@: limit reset, you're good to go.": "%@: limite azzerato, puoi ripartire.",
+    "~%d%% a day lasts until the reset": "~%d%% al giorno per arrivare al reset",
+    "%@ is nearly used up. Other models still have %d%% left this week.":
+        "%@ è quasi esaurito. Agli altri modelli resta il %d%% questa settimana.",
+    "Show": "Mostra",
+    "% used": "% usata",
+    "% left": "% rimasta",
+    "Time to reset": "Tempo al reset",
+    "Icon only": "Solo icona",
 ]
 
 func tr(_ s: String) -> String { lang == "it" ? italian[s] ?? s : s }
@@ -126,6 +134,12 @@ struct Limit: Identifiable {
         return percent / elapsed
     }
 
+    /// Weekly limits: the share you can use per day and still last until the reset.
+    var dailyBudget: Double? {
+        guard case .week = kind, let r = resetsAt, r.timeIntervalSinceNow > 86400, effective < 100 else { return nil }
+        return (100 - effective) / (r.timeIntervalSinceNow / 86400)
+    }
+
     /// When the limit hits 100% at the current burn rate, if that happens before the window resets.
     var runsOutAt: Date? {
         guard percent < 100, let rate, rate > 0, let r = resetsAt, r > Date(),
@@ -140,6 +154,14 @@ struct Service {
     let plan: String?
     var limits: [Limit]
     let updated: Date?
+
+    /// A per-model weekly bucket (e.g. Fable) past 90% while the all-models week still has room: suggest switching.
+    var switchHint: (limit: Limit, text: String)? {
+        guard let all = limits.first(where: { $0.kind == .week(model: "all models") }), all.effective < 90,
+              let tight = limits.first(where: { if case .week(let m?) = $0.kind { return m != "all models" && $0.effective >= 90 }; return false }),
+              case .week(let m?) = tight.kind else { return nil }
+        return (tight, String(format: tr("%@ is nearly used up. Other models still have %d%% left this week."), m, Int((100 - all.effective).rounded())))
+    }
 }
 
 let home = FileManager.default.homeDirectoryForCurrentUser
@@ -415,8 +437,8 @@ final class Store: ObservableObject {
     @Published var barMode = defaults.string(forKey: "barMode") ?? "peak" {   // peak | session | week
         didSet { Self.defaults.set(barMode, forKey: "barMode") }
     }
-    @Published var showRemaining = defaults.bool(forKey: "showRemaining") {
-        didSet { Self.defaults.set(showRemaining, forKey: "showRemaining") }
+    @Published var barText = defaults.string(forKey: "barText") ?? (defaults.bool(forKey: "showRemaining") ? "left" : "used") {   // used | left | reset | icon
+        didSet { Self.defaults.set(barText, forKey: "barText") }
     }
     @Published var refreshMinutes = defaults.object(forKey: "refreshMinutes") as? Int ?? 5 {
         didSet { Self.defaults.set(refreshMinutes, forKey: "refreshMinutes") }
@@ -427,7 +449,8 @@ final class Store: ObservableObject {
     @Published var notify = defaults.bool(forKey: "notify") {
         didSet {
             Self.defaults.set(notify, forKey: "notify")
-            if notify { UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in } }
+            let center = UNUserNotificationCenter.current()
+            if notify { center.requestAuthorization(options: [.alert, .sound]) { _, _ in } } else { center.removeAllPendingNotificationRequests() }
         }
     }
     @Published var checkUpdates = defaults.bool(forKey: "checkUpdates") {
@@ -442,17 +465,16 @@ final class Store: ObservableObject {
 
     init() { lang = resolveLanguage(language) }
 
-    /// The % used shown in the menu bar for a service, per the "Limit shown" setting.
-    func barValue(_ s: Service?) -> Double? {
-        guard let s else { return nil }
-        let pick = s.limits.filter {
+    /// The limit shown in the menu bar for a service, per the "Limit shown" setting.
+    func barLimit(_ s: Service?) -> Limit? {
+        s?.limits.filter {
             switch (barMode, $0.kind) {
             case ("session", .session), ("week", .week), ("peak", _): return true
             default: return false
             }
-        }
-        return pick.map(\.effective).max()
+        }.max { $0.effective < $1.effective }
     }
+    func barValue(_ s: Service?) -> Double? { barLimit(s)?.effective }
 
     func reloadLocal() {
         codex = readCodex().map(withRates)
@@ -493,12 +515,23 @@ final class Store: ObservableObject {
         for s in [claude, codex].compactMap({ $0 }) where -(s.updated ?? .distantPast).timeIntervalSinceNow < hour {
             for l in s.limits {
                 let k = key(s, l), p = Int(l.effective)
+                if p >= 90, sent[k + "|reset"] == nil, let r = l.resetsAt, r.timeIntervalSinceNow > 60 {
+                    // Scheduled with the system, so it arrives at the reset even if Burny isn't running then.
+                    sent[k + "|reset"] = 1
+                    let c = UNMutableNotificationContent()
+                    c.title = s.name
+                    c.body = String(format: tr("%@: limit reset, you're good to go."), l.label)
+                    c.sound = .default
+                    let trigger = UNTimeIntervalNotificationTrigger(timeInterval: r.timeIntervalSinceNow, repeats: false)
+                    UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: k + "|reset", content: c, trigger: trigger))
+                }
                 guard let level = [90, 80].first(where: { p >= $0 }), level > (sent[k] ?? 0) else { continue }
                 sent[k] = level
                 let c = UNMutableNotificationContent()
                 c.title = String(format: tr("%@ at %d%%"), s.name, p)
                 var body = String(format: tr("%@ · resets %@"), l.label, shortWhen(l.resetsAt))
                 if let eta = l.runsOutAt { body += " " + String(format: tr("At this pace it runs out ~%@."), shortWhen(eta)) }
+                if let hint = s.switchHint, hint.limit.kind == l.kind { body += " " + hint.text }
                 c.body = body
                 c.sound = .default
                 UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: k, content: c, trigger: nil))
@@ -566,6 +599,13 @@ func shortWhen(_ d: Date?) -> String {
     return (cal.isDateInTomorrow(d) ? tr("tomorrow") + " " : "") + f.string(from: d)
 }
 
+/// "45m", "3h12" or "2d4h", for the menu bar.
+func compactUntil(_ d: Date?) -> String? {
+    guard let d, d > Date() else { return nil }
+    let m = Int(d.timeIntervalSinceNow / 60)
+    return m < 60 ? "\(m)m" : m < 1440 ? String(format: "%dh%02d", m / 60, m % 60) : "\(m / 1440)\(tr("d"))\(m % 1440 / 60)h"
+}
+
 func resetLine(_ d: Date?) -> String {
     guard let d else { return " " }
     if d < Date() { return tr("Reset") }
@@ -611,6 +651,9 @@ struct LimitRow: View {
             if let eta = limit.runsOutAt {
                 Label(String(format: tr("Runs out ~%@ at this pace"), shortWhen(eta)), systemImage: "flame.fill")
                     .font(.system(size: 10.5, weight: .medium)).foregroundStyle(.orange)
+            } else if let b = limit.dailyBudget {
+                Label(String(format: tr("~%d%% a day lasts until the reset"), Int(b.rounded(.down))), systemImage: "calendar")
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary)
             }
         }
     }
@@ -653,6 +696,10 @@ struct ServiceCard: View {
                     ForEach(s.limits) { LimitRow(limit: $0, accent: accent) }
                 }
                 .opacity(stale ? 0.45 : 1)
+                if let hint = s.switchHint, !stale {
+                    Label(hint.text, systemImage: "arrow.triangle.swap")
+                        .font(.system(size: 10.5, weight: .medium)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
                 if stale && name == "Codex" {
                     Text(tr("Updates when you use Codex.")).font(.system(size: 10.5)).foregroundStyle(.secondary)
                 }
@@ -780,12 +827,14 @@ struct SettingsView: View {
                     }
                     .labelsHidden().fixedSize()
                 }
-                SettingRow(label: "Percentage") {
-                    Picker("", selection: $store.showRemaining) {
-                        Text(tr("Used")).tag(false)
-                        Text(tr("Left")).tag(true)
+                SettingRow(label: "Show") {
+                    Picker("", selection: $store.barText) {
+                        Text(tr("% used")).tag("used")
+                        Text(tr("% left")).tag("left")
+                        Text(tr("Time to reset")).tag("reset")
+                        Text(tr("Icon only")).tag("icon")
                     }
-                    .pickerStyle(.segmented).labelsHidden().fixedSize()
+                    .labelsHidden().fixedSize()
                 }
             }
             SettingsSection(title: "Refresh") {
@@ -797,7 +846,7 @@ struct SettingsView: View {
                 }
             }
             SettingsSection(title: "Notifications") {
-                SettingRow(label: "Alert at 80% and 90%", note: "Once per limit and window.") {
+                SettingRow(label: "Alert at 80% and 90%", note: "Once per limit and window. Also tells you when a limit past 90% resets.") {
                     Toggle("", isOn: $store.notify).toggleStyle(.switch).controlSize(.mini).labelsHidden()
                 }
             }
@@ -973,14 +1022,19 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let s { tip.append(s.name + ": " + s.limits.map { "\($0.label) \(Int($0.effective.rounded()))%" }.joined(separator: ", ")) }
             guard shown[i] else { continue }
             if title.length > 0 { title.append(NSAttributedString(string: "  ", attributes: [.font: font])) }
-            let p = store.barValue(s)   // colour always follows % used
+            let l = store.barLimit(s), p = l?.effective   // colour always follows % used
             let att = NSTextAttachment()
-            att.image = icons[i] ?? ring(p, accent)
-            att.bounds = CGRect(x: 0, y: -4, width: 17, height: 17)
+            att.image = store.barText == "icon" ? ring(p, accent) : icons[i] ?? ring(p, accent)   // icon only: the ring shows the level
+            att.bounds = store.barText == "icon" ? CGRect(x: 0, y: -2, width: 14, height: 14) : CGRect(x: 0, y: -4, width: 17, height: 17)
             title.append(NSAttributedString(attachment: att))
+            guard store.barText != "icon" else { continue }
             let color: NSColor = p.map { $0 >= 90 ? .systemRed : $0 >= 75 ? .systemOrange : .labelColor } ?? .secondaryLabelColor
-            let value = p.map { store.showRemaining ? max(0, 100 - $0) : $0 }
-            title.append(NSAttributedString(string: " " + (value.map { "\(Int($0.rounded()))%" } ?? "–"), attributes: [.font: font, .foregroundColor: color]))
+            let text: String? = switch store.barText {
+            case "reset": compactUntil(l?.resetsAt)
+            case "left": p.map { "\(Int(max(0, 100 - $0).rounded()))%" }
+            default: p.map { "\(Int($0.rounded()))%" }
+            }
+            title.append(NSAttributedString(string: " " + (text ?? "–"), attributes: [.font: font, .foregroundColor: color]))
         }
         if title.length == 0 {   // both hidden: keep a clickable glyph
             let att = NSTextAttachment()
@@ -1061,6 +1115,13 @@ if args.contains("--self-test") {
     check(f.runsOutAt.map { abs($0.timeIntervalSinceNow - hour) < 5 } == true, "forecast: runs out before reset")
     f.recentRate = 1.0 / hour
     check(f.runsOutAt == nil, "forecast: lasts until reset")
+    let wk = Limit(kind: .week(model: nil), percent: 40, resetsAt: Date().addingTimeInterval(3 * 86400 + 60), window: week)
+    check(wk.dailyBudget.map { abs($0 - 20) < 0.1 } == true, "budget: 60% left over 3 days is ~20% a day")
+    let fable = Service(name: "Claude Code", plan: nil, limits: [
+        Limit(kind: .week(model: "all models"), percent: 50, resetsAt: nil, window: week),
+        Limit(kind: .week(model: "Fable"), percent: 93, resetsAt: nil, window: week)], updated: nil)
+    check(fable.switchHint?.limit.kind == .week(model: "Fable"), "hint: switch model when one bucket is nearly used up")
+    check(compactUntil(Date().addingTimeInterval(3 * hour + 5 * 60 + 30)) == "3h05", "menu bar: compact countdown")
     check(isNewer("1.10.0", than: "1.9.2") && !isNewer("1.1.0", than: "1.1.0") && !isNewer("1.0.9", than: "1.1"), "update: version comparison")
 
     print(failures == 0 ? "all checks passed" : "\(failures) check(s) failed")

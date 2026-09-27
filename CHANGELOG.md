@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 — 2026-09-27
+
+- **"You're good to go" alert:** when a limit passes 90%, Burny schedules a notification for the moment it resets. macOS delivers it even if Burny isn't running by then.
+- **Daily budget** on weekly limits, e.g. "~16% a day lasts until the reset".
+- **Model switch hint:** when a per-model bucket such as Fable passes 90% but the all-models week still has room, Burny says so in the popover and in the alert.
+- **Menu bar display:** % used, % left, time to reset, or icon only (a ring that fills up).
 ## 1.1.0 — 2026-09-27
 
 - **Burn forecast:** "Runs out ~18:40 at this pace" when your pace would hit a limit before it resets. It uses your recent readings, falling back to the average since the window opened.

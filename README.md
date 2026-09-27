@@ -26,8 +26,10 @@
 - **Pace marker.** The tick on each bar shows where you'd be if you spread usage evenly across the window. Ahead of the tick means you're burning fast.
 - **Burn forecast.** "Runs out ~18:40 at this pace" whenever your current pace would hit the limit before it resets.
 - **Reset countdowns.** "Resets in 4h 12m · 00:40" for every window.
-- **Alerts** at 80% and 90% (optional), once per limit and window.
-- **Settings.** Open at login, show or hide each service, choose which limit the bar shows, % used or % left, refresh interval, alerts, update check, and English or Italian.
+- **Alerts** at 80% and 90% (optional), once per limit and window, plus a "you're good to go" alert when a limit you'd nearly used up resets.
+- **Daily budget.** On weekly limits: how much you can use per day and still last until the reset.
+- **Model switch hint.** When a per-model bucket such as Fable is nearly used up while other models still have room.
+- **Settings.** Open at login, show or hide each service, choose which limit the bar shows and how (% used, % left, time to reset or icon only), refresh interval, alerts, update check, and English or Italian.
 - **Tiny.** One Swift file with no dependencies: ~290 KB binary, ~13 MB RAM, 0% CPU at idle.
 
 ## Install
