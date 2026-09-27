@@ -11,5 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile
         run: swiftc -Osize Sources/main.swift -o burny
+      - name: Self-test (parsers, forecast, version compare)
+        run: ./burny --self-test
       - name: Smoke test (render the app icon)
         run: ./burny --icon icon.png 256 && test -s icon.png

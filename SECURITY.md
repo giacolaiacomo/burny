@@ -21,9 +21,13 @@ To read your Claude limits, Burny runs the official CLI's own `/usage` command, 
 
 Burny reads the newest `~/.codex/sessions/**/rollout-*.jsonl` files backwards and parses only the `rate_limits` object of the most recent `token_count` event. It reads them only; nothing is written or sent anywhere.
 
+## Update check (optional, off by default)
+
+If you turn on **Check for updates**, Burny sends at most one request a day to `https://api.github.com/repos/giacolaiacomo/burny/releases/latest`. It uses an ephemeral session with no cookies, and the only identifying header is `User-Agent: Burny/<version>`. If a newer version exists, Burny shows a link to the release page. It never downloads or installs anything by itself; you update with `git pull && ./install.sh`.
+
 ## What Burny never does
 
-- Make network requests of its own.
+- Contact Anthropic or OpenAI itself, or make any network request other than the optional update check above.
 - Read, copy or forward OAuth tokens, API keys, cookies or Keychain items.
 - Call private or undocumented endpoints.
 - Send telemetry, or write anything outside `~/Library/Preferences/com.burny.menubar.plist` and `~/Library/Caches/Burny`.

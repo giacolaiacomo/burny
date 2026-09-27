@@ -1,15 +1,18 @@
 // Burny — a tiny macOS menu bar app showing your Claude Code and Codex (ChatGPT) plan limits.
 //
-// It makes no network calls of its own and never touches credentials:
+// It never contacts Anthropic or OpenAI itself and never touches credentials:
 //   Claude Code: runs the official `claude -p /usage` (0 tokens — the same request as typing /usage)
 //   Codex:       reads the rate_limits the Codex CLI already logs in ~/.codex/sessions/**/rollout-*.jsonl
+// Its only possible network request is the opt-in update check to GitHub's public releases API.
 
 import AppKit
 import SwiftUI
 import Combine
+import UserNotifications
 
 let bundleID = "com.burny.menubar"
-let appVersion = "1.0.0"   // install.sh reads this for Info.plist
+let repoSlug = "giacolaiacomo/burny"
+let appVersion = "1.1.0"   // install.sh reads this for Info.plist
 
 // MARK: Localization (English + Italian; add a language by adding a table)
 
@@ -55,10 +58,26 @@ let italian: [String: String] = [
     "Percentage": "Percentuale",
     "Used": "Usata",
     "Left": "Rimasta",
-    "Refresh": "Aggiornamento",
+    "Refresh": "Frequenza",
     "Claude every": "Claude ogni",
     "Runs the official /usage: 0 tokens. Codex is read from local logs every 30 s.":
         "Esegue /usage del client ufficiale: 0 token. Codex si legge dai log locali ogni 30 s.",
+    "Runs out ~%@ at this pace": "Finisce verso %@ a questo ritmo",
+    "Updates when you use Codex.": "Si aggiorna quando usi Codex.",
+    "Notifications": "Notifiche",
+    "Alert at 80% and 90%": "Avvisa all'80% e al 90%",
+    "Once per limit and window.": "Una volta per limite e finestra.",
+    "%@ at %d%%": "%@ al %d%%",
+    "%@ · resets %@": "%@ · si azzera %@",
+    "At this pace it runs out ~%@.": "A questo ritmo finisce verso %@.",
+    "Updates": "Nuove versioni",
+    "Check for updates": "Controlla aggiornamenti",
+    "Once a day asks GitHub for the latest release. Nothing else is sent, nothing is installed.":
+        "Una volta al giorno chiede a GitHub l'ultima versione. Non invia altro e non installa nulla.",
+    "Burny %@ is available": "È disponibile Burny %@",
+    "View": "Vedi",
+    "You're up to date.": "Sei aggiornato.",
+    "Check now": "Controlla ora",
 ]
 
 func tr(_ s: String) -> String { lang == "it" ? italian[s] ?? s : s }
@@ -94,12 +113,32 @@ struct Limit: Identifiable {
         guard let r = resetsAt, r > Date(), window > 0 else { return nil }
         return min(1, max(0, 1 - r.timeIntervalSinceNow / window))
     }
+
+    var measuredAt = Date()        // when `percent` was observed
+    var recentRate: Double? = nil  // % per second over the last readings, set by Store
+
+    /// Burn rate in % per second: recent readings when there are enough, else the average since the window opened.
+    var rate: Double? {
+        if let recentRate { return recentRate }
+        guard let r = resetsAt, window > 0, percent > 0 else { return nil }
+        let elapsed = window - r.timeIntervalSince(measuredAt)
+        guard elapsed > max(window * 0.05, 600) else { return nil }   // too early in the window to tell
+        return percent / elapsed
+    }
+
+    /// When the limit hits 100% at the current burn rate, if that happens before the window resets.
+    var runsOutAt: Date? {
+        guard percent < 100, let rate, rate > 0, let r = resetsAt, r > Date(),
+              -measuredAt.timeIntervalSinceNow < 6 * hour else { return nil }   // no forecasts from stale data
+        let eta = measuredAt.addingTimeInterval((100 - percent) / rate)
+        return eta < r ? max(eta, Date()) : nil
+    }
 }
 
 struct Service {
     let name: String
     let plan: String?
-    let limits: [Limit]
+    var limits: [Limit]
     let updated: Date?
 }
 
@@ -219,12 +258,15 @@ func parseReset(_ s: String, tz: String?) -> Date? {
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
     f.timeZone = tz.flatMap(TimeZone.init(identifier:)) ?? .current
-    f.defaultDate = Date()
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = f.timeZone
+    f.defaultDate = cal.startOfDay(for: Date())   // fields the text omits (year, day, minutes) must not come from the clock
     let str = s.uppercased().replacingOccurrences(of: " AT ", with: " at ")
     for fmt in ["MMM d 'at' h:mma", "MMM d 'at' ha", "h:mma", "ha", "MMM d"] {
         f.dateFormat = fmt
         if var d = f.date(from: str) {
-            if d < Date().addingTimeInterval(-86400) { d = Calendar.current.date(byAdding: .year, value: 1, to: d) ?? d }
+            if fmt.hasPrefix("h"), d < Date() { d = cal.date(byAdding: .day, value: 1, to: d) ?? d }   // time only: next occurrence
+            if d < Date().addingTimeInterval(-86400) { d = cal.date(byAdding: .year, value: 1, to: d) ?? d }
             return d
         }
     }
@@ -306,15 +348,17 @@ func readCodex() -> Service? {
     for (f, mt) in files.prefix(10) {
         guard let obj = autoreleasepool(invoking: { lastRateLimitLine(f) }),
               let rl = (obj["payload"] as? [String: Any])?["rate_limits"] as? [String: Any] else { continue }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let ts = (obj["timestamp"] as? String).flatMap { iso.date(from: $0) } ?? mt
         func lim(_ k: String) -> Limit? {
             guard let d = rl[k] as? [String: Any], let p = (d["used_percent"] as? NSNumber)?.doubleValue else { return nil }
             let mins = (d["window_minutes"] as? NSNumber)?.intValue ?? 0
             let kind: Kind = mins >= 10080 ? .week(model: nil) : mins > 0 && mins < 1440 ? .session(hours: mins / 60) : .other(hours: mins / 60)
-            return Limit(kind: kind, percent: p, resetsAt: epoch(d["resets_at"]), window: Double(mins) * 60)
+            var l = Limit(kind: kind, percent: p, resetsAt: epoch(d["resets_at"]), window: Double(mins) * 60)
+            l.measuredAt = ts
+            return l
         }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let ts = (obj["timestamp"] as? String).flatMap { iso.date(from: $0) } ?? mt
         let service = Service(name: "Codex", plan: (rl["plan_type"] as? String)?.capitalized,
                               limits: [lim("primary"), lim("secondary")].compactMap { $0 }, updated: ts)
         if let newest = files.first { codexCache = (newest.0, newest.1, service) }
@@ -380,9 +424,21 @@ final class Store: ObservableObject {
     @Published var launchAtLogin = LoginItem.isEnabled {
         didSet { if launchAtLogin != oldValue { LoginItem.set(launchAtLogin) } }
     }
+    @Published var notify = defaults.bool(forKey: "notify") {
+        didSet {
+            Self.defaults.set(notify, forKey: "notify")
+            if notify { UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in } }
+        }
+    }
+    @Published var checkUpdates = defaults.bool(forKey: "checkUpdates") {
+        didSet { Self.defaults.set(checkUpdates, forKey: "checkUpdates"); if checkUpdates { checkForUpdates(force: true) } }
+    }
+    @Published var update: (version: String, url: URL)?
+    @Published var upToDate = false
 
     private var fetched: (limits: [Limit], at: Date)?
     private var plan: String?
+    private var history: [String: [(at: Date, percent: Double)]] = [:]   // recent readings per limit and window
 
     init() { lang = resolveLanguage(language) }
 
@@ -399,8 +455,79 @@ final class Store: ObservableObject {
     }
 
     func reloadLocal() {
-        codex = readCodex()
-        claude = fetched.map { Service(name: "Claude Code", plan: plan, limits: $0.limits, updated: $0.at) }
+        codex = readCodex().map(withRates)
+        claude = fetched.map { f in
+            withRates(Service(name: "Claude Code", plan: plan, limits: f.limits.map { var l = $0; l.measuredAt = f.at; return l }, updated: f.at))
+        }
+        if notify { notifyThresholds() }
+    }
+
+    private func key(_ s: Service, _ l: Limit) -> String {
+        "\(s.name)|\(l.kind)|\(Int(l.resetsAt?.timeIntervalSince1970 ?? 0))"
+    }
+
+    /// Records each reading and attaches the recent burn rate (session: last 45 min, week: last 6 h).
+    private func withRates(_ s: Service) -> Service {
+        var out = s
+        out.limits = s.limits.map { l in
+            var l = l
+            let k = key(s, l)
+            var h = history[k] ?? []
+            if h.last?.at != l.measuredAt { h.append((l.measuredAt, l.percent)) }
+            h.removeAll { $0.at < Date().addingTimeInterval(-7 * hour) }
+            history[k] = h
+            let lookback: TimeInterval = l.window <= 5 * hour ? 45 * 60 : 6 * hour
+            let recent = h.filter { $0.at >= l.measuredAt.addingTimeInterval(-lookback) }
+            if let first = recent.first, let last = recent.last, last.at.timeIntervalSince(first.at) >= 15 * 60 {
+                l.recentRate = max(0, last.percent - first.percent) / last.at.timeIntervalSince(first.at)
+            }
+            return l
+        }
+        return out
+    }
+
+    // MARK: Notifications — once per limit, window and threshold
+
+    private func notifyThresholds() {
+        var sent = Self.defaults.dictionary(forKey: "notified") as? [String: Int] ?? [:]
+        for s in [claude, codex].compactMap({ $0 }) where -(s.updated ?? .distantPast).timeIntervalSinceNow < hour {
+            for l in s.limits {
+                let k = key(s, l), p = Int(l.effective)
+                guard let level = [90, 80].first(where: { p >= $0 }), level > (sent[k] ?? 0) else { continue }
+                sent[k] = level
+                let c = UNMutableNotificationContent()
+                c.title = String(format: tr("%@ at %d%%"), s.name, p)
+                var body = String(format: tr("%@ · resets %@"), l.label, shortWhen(l.resetsAt))
+                if let eta = l.runsOutAt { body += " " + String(format: tr("At this pace it runs out ~%@."), shortWhen(eta)) }
+                c.body = body
+                c.sound = .default
+                UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: k, content: c, trigger: nil))
+            }
+        }
+        if sent.count > 60 { sent = [:] }   // old windows; a cleared entry can only re-alert for a live window
+        Self.defaults.set(sent, forKey: "notified")
+    }
+
+    // MARK: Update check — opt-in, GitHub's public API only, at most once a day
+
+    func checkForUpdates(force: Bool = false) {
+        guard checkUpdates else { update = nil; return }
+        let last = Self.defaults.double(forKey: "lastUpdateCheck")
+        guard force || Date().timeIntervalSince1970 - last > 24 * hour else { return }
+        Self.defaults.set(Date().timeIntervalSince1970, forKey: "lastUpdateCheck")
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repoSlug)/releases/latest")!, timeoutInterval: 15)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("Burny/\(appVersion)", forHTTPHeaderField: "User-Agent")
+        URLSession(configuration: .ephemeral).dataTask(with: req) { data, _, _ in   // ephemeral: no cookies, no cache
+            guard let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = obj["tag_name"] as? String, let page = (obj["html_url"] as? String).flatMap(URL.init(string:)),
+                  page.host == "github.com" else { return }
+            let v = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+            DispatchQueue.main.async {
+                self.update = isNewer(v, than: appVersion) ? (v, page) : nil
+                self.upToDate = self.update == nil
+            }
+        }.resume()
     }
 
     func fetch(ifOlderThan age: TimeInterval = 0) {
@@ -422,13 +549,27 @@ final class Store: ObservableObject {
 
 func levelColor(_ p: Double, _ accent: Color) -> Color { p >= 90 ? .red : p >= 75 ? .orange : accent }
 
-func resetLine(_ d: Date?) -> String {
-    guard let d else { return " " }
-    if d < Date() { return tr("Reset") }
+func isNewer(_ a: String, than b: String) -> Bool {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) where (i < x.count ? x[i] : 0) != (i < y.count ? y[i] : 0) {
+        return (i < x.count ? x[i] : 0) > (i < y.count ? y[i] : 0)
+    }
+    return false
+}
+
+/// "18:40", "tomorrow 00:40" or "Sat 3 · 14:00".
+func shortWhen(_ d: Date?) -> String {
+    guard let d else { return "" }
     let cal = Calendar.current, f = DateFormatter()
     f.locale = Locale(identifier: lang == "it" ? "it_IT" : "en_US")
     f.dateFormat = cal.isDateInToday(d) || cal.isDateInTomorrow(d) ? "HH:mm" : "EEE d · HH:mm"
-    let when = (cal.isDateInTomorrow(d) ? tr("tomorrow") + " " : "") + f.string(from: d)
+    return (cal.isDateInTomorrow(d) ? tr("tomorrow") + " " : "") + f.string(from: d)
+}
+
+func resetLine(_ d: Date?) -> String {
+    guard let d else { return " " }
+    if d < Date() { return tr("Reset") }
+    let when = shortWhen(d)
     let m = Int(d.timeIntervalSinceNow / 60)
     let rel = m < 60 ? "\(m)m" : m < 1440 ? "\(m / 60)h \(m % 60)m" : "\(m / 1440)\(tr("d")) \(m % 1440 / 60)h"
     return String(format: tr("Resets in %@ · %@"), rel, when)
@@ -467,6 +608,10 @@ struct LimitRow: View {
             }
             .frame(height: 6)
             Text(resetLine(limit.resetsAt)).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+            if let eta = limit.runsOutAt {
+                Label(String(format: tr("Runs out ~%@ at this pace"), shortWhen(eta)), systemImage: "flame.fill")
+                    .font(.system(size: 10.5, weight: .medium)).foregroundStyle(.orange)
+            }
         }
     }
 }
@@ -484,6 +629,11 @@ struct ServiceCard: View {
         case .ok: return "No data yet — use it once and it will show up here."
         }
     }
+    /// Claude is fetched every few minutes; Codex only updates when you use it.
+    var stale: Bool {
+        guard let u = service?.updated else { return false }
+        return -u.timeIntervalSinceNow > (name == "Codex" ? 6 * hour : 30 * 60)
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 7) {
@@ -495,10 +645,17 @@ struct ServiceCard: View {
                         .background(Capsule().fill(accent.opacity(0.16))).foregroundStyle(accent)
                 }
                 Spacer()
-                Text(ago(service?.updated)).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                Text(ago(service?.updated)).font(.system(size: 10.5))
+                    .foregroundStyle(stale ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
             }
             if let s = service, !s.limits.isEmpty {
-                ForEach(s.limits) { LimitRow(limit: $0, accent: accent) }
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(s.limits) { LimitRow(limit: $0, accent: accent) }
+                }
+                .opacity(stale ? 0.45 : 1)
+                if stale && name == "Codex" {
+                    Text(tr("Updates when you use Codex.")).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                }
             } else {
                 Text(tr(emptyMessage)).font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
@@ -526,6 +683,16 @@ struct UsageView: View {
                     Button { settings = true } label: { Image(systemName: "gearshape") }
                         .buttonStyle(.borderless).help(tr("Settings"))
                 }
+            }
+            if let u = store.update, !settings {
+                HStack {
+                    Image(systemName: "arrow.down.circle.fill").foregroundStyle(.orange)
+                    Text(String(format: tr("Burny %@ is available"), u.version)).font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    Button(tr("View")) { NSWorkspace.shared.open(u.url) }.controlSize(.small)
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.12)))
             }
             if settings {
                 SettingsView(store: store)
@@ -627,6 +794,28 @@ struct SettingsView: View {
                         ForEach([2, 5, 10, 15], id: \.self) { Text("\($0) min").tag($0) }
                     }
                     .labelsHidden().fixedSize()
+                }
+            }
+            SettingsSection(title: "Notifications") {
+                SettingRow(label: "Alert at 80% and 90%", note: "Once per limit and window.") {
+                    Toggle("", isOn: $store.notify).toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                }
+            }
+            SettingsSection(title: "Updates") {
+                SettingRow(label: "Check for updates", note: "Once a day asks GitHub for the latest release. Nothing else is sent, nothing is installed.") {
+                    Toggle("", isOn: $store.checkUpdates).toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                }
+                if store.checkUpdates {
+                    HStack {
+                        if let u = store.update {
+                            Text(String(format: tr("Burny %@ is available"), u.version)).foregroundStyle(.orange)
+                        } else if store.upToDate {
+                            Text(tr("You're up to date."))
+                        }
+                        Spacer()
+                        Button(tr("Check now")) { store.checkForUpdates(force: true) }.controlSize(.small)
+                    }
+                    .font(.system(size: 11))
                 }
             }
             Text("Burny \(appVersion)").font(.system(size: 10.5)).foregroundStyle(.tertiary).frame(maxWidth: .infinity)
@@ -754,7 +943,9 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 guard let self else { return }
                 self.store.fetch(ifOlderThan: Double(self.store.refreshMinutes * 60) - 5)
             },
+            Timer.scheduledTimer(withTimeInterval: hour, repeats: true) { [weak self] _ in self?.store.checkForUpdates() },   // no-op unless opted in, max once a day
         ]
+        store.checkForUpdates()
     }
 
     // The real app icons make it obvious which number is which; fall back to a coloured ring.
@@ -819,12 +1010,61 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
 // MARK: Entry point
 //
-// Dev helpers:  --icon out.png [px]                        renders the app icon
+// Dev helpers:  --self-test                                checks the parsers (run by CI)
+//               --icon out.png [px]                        renders the app icon
 //               --snapshot out.png [dark] [settings] [en|it]  renders the popover with live data
 
 let args = CommandLine.arguments
 func png(_ rep: NSBitmapImageRep, _ path: String) {
     try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+}
+
+// `Burny --self-test` checks the parsers against real outputs; the CI build runs it so a format change is caught early.
+if args.contains("--self-test") {
+    var failures = 0
+    func check(_ ok: Bool, _ what: String) { print((ok ? "ok   " : "FAIL ") + what); if !ok { failures += 1 } }
+
+    let usage = """
+    You are currently using your subscription to power your Claude Code usage
+
+    Current session: 5% used · resets Sep 28 at 12:40am (Europe/Rome)
+    Current week (all models): 28% used · resets Oct 3 at 2pm (Europe/Rome)
+    Current week (Fable): 6% used · resets Oct 3 at 2pm (Europe/Rome)
+
+    What's contributing to your limits usage?
+    """
+    let l = parseUsage(usage)
+    check(l.count == 3, "/usage: three limits")
+    check(l.map(\.percent) == [5, 28, 6], "/usage: percentages")
+    check(l.map(\.kind) == [.session(hours: 5), .week(model: "all models"), .week(model: "Fable")], "/usage: kinds")
+    var rome = Calendar(identifier: .gregorian)
+    rome.timeZone = TimeZone(identifier: "Europe/Rome")!
+    let reset = l.count == 3 ? l[1].resetsAt.map { rome.dateComponents([.month, .day, .hour, .minute], from: $0) } : nil
+    check(reset?.month == 10 && reset?.day == 3 && reset?.hour == 14 && reset?.minute == 0, "/usage: reset time and timezone")
+    let bare = parseUsage("Current session: 0% used\nCurrent week (all models): 12.5% used · resets 9:05pm (UTC)")
+    check(bare.count == 2 && bare[0].resetsAt == nil && bare[1].percent == 12.5 && bare[1].resetsAt != nil, "/usage: no reset, decimals, time only")
+
+    // Codex log: the rate_limits line sits before a >256 KB line, so the backwards reader must cross chunks.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("burny-selftest-\(getpid())")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let log = dir.appendingPathComponent("rollout.jsonl")
+    let rl = #"{"timestamp":"2026-09-22T22:16:05.696Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":97.0,"window_minutes":300,"resets_at":1790131440},"secondary":{"used_percent":31.0,"window_minutes":10080,"resets_at":1790679309},"plan_type":"plus"}}}"#
+    let noise = #"{"type":"response_item","payload":{"text":"\#(String(repeating: "x", count: 300_000))"}}"#
+    try? ([#"{"type":"session_meta"}"#, rl, noise].joined(separator: "\n") + "\n").write(to: log, atomically: true, encoding: .utf8)
+    let line = lastRateLimitLine(log)
+    let prim = ((line?["payload"] as? [String: Any])?["rate_limits"] as? [String: Any])?["primary"] as? [String: Any]
+    check((prim?["used_percent"] as? NSNumber)?.doubleValue == 97, "codex: rate_limits found across chunks")
+    try? FileManager.default.removeItem(at: dir)
+
+    var f = Limit(kind: .session(hours: 5), percent: 50, resetsAt: Date().addingTimeInterval(2 * hour), window: 5 * hour)
+    f.recentRate = 50.0 / hour   // 50 % per hour → out in one hour, before the reset
+    check(f.runsOutAt.map { abs($0.timeIntervalSinceNow - hour) < 5 } == true, "forecast: runs out before reset")
+    f.recentRate = 1.0 / hour
+    check(f.runsOutAt == nil, "forecast: lasts until reset")
+    check(isNewer("1.10.0", than: "1.9.2") && !isNewer("1.1.0", than: "1.1.0") && !isNewer("1.0.9", than: "1.1"), "update: version comparison")
+
+    print(failures == 0 ? "all checks passed" : "\(failures) check(s) failed")
+    exit(failures == 0 ? 0 : 1)
 }
 
 if let i = args.firstIndex(of: "--icon"), i + 1 < args.count {
