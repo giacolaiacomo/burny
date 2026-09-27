@@ -4,6 +4,7 @@ Headroom is designed so that installing it cannot put your accounts at risk.
 
 **What it does**
 - Runs `claude -p /usage --output-format json --no-session-persistence --setting-sources user --settings '{"disableAllHooks":true}'` from `~/Library/Caches/Headroom`. It's the official Claude Code CLI doing its own read-only `/usage` request, with 0 tokens and $0 cost. Your hooks are disabled for that call and no session is saved.
+- Runs that CLI inside a `sandbox-exec` profile that blocks Desktop, Documents, Downloads, Pictures, Movies, Music and iCloud Drive. It never needs them, and it means macOS never asks you for folder access on Headroom's behalf.
 - Reads the newest `~/.codex/sessions/**/rollout-*.jsonl` files backwards, parsing only the `rate_limits` object of the most recent `token_count` event.
 - Reads `~/.claude.json` only to show your plan tier (Pro / Max).
 - Stores its settings in `~/Library/Preferences/com.headroom.menubar.plist`.

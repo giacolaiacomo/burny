@@ -56,7 +56,7 @@ Headroom **makes no network requests, never reads tokens or passwords, and never
 
 | | Source | How often |
 |---|---|---|
-| **Claude Code** | Runs the official CLI: `claude -p /usage`. It's exactly what typing `/usage` does: 0 tokens, $0, with hooks disabled and no session saved. | Every 5 min (configurable) and when you open the popover |
+| **Claude Code** | Runs the official CLI: `claude -p /usage`. It's exactly what typing `/usage` does: 0 tokens, $0, with hooks disabled, no session saved, and sandboxed away from your personal folders. | Every 5 min (configurable) and when you open the popover |
 | **Codex** | Reads the `rate_limits` the Codex CLI already writes to `~/.codex/sessions/`. It only reads the tail of the newest log, in small chunks. | Every 30 s, local disk only |
 
 Because it only uses the vendors' own clients and files they already write on your Mac, nothing looks different to Anthropic or OpenAI than you using their tools normally. The Claude plan badge (Pro / Max) is read from `~/.claude.json`. See [SECURITY.md](SECURITY.md) for the full picture.

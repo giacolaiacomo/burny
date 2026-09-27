@@ -125,10 +125,21 @@ func fetchClaudeUsage() -> [Limit]? {
     let cwd = home.appendingPathComponent("Library/Caches/Headroom")
     try? FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: bin)
     // No hooks, no saved session, only the user's own settings: nothing but the /usage request.
-    p.arguments = ["-p", "/usage", "--output-format", "json", "--no-session-persistence",
-                   "--setting-sources", "user", "--settings", "{\"disableAllHooks\":true}"]
+    let claudeArgs = ["-p", "/usage", "--output-format", "json", "--no-session-persistence",
+                      "--setting-sources", "user", "--settings", "{\"disableAllHooks\":true}"]
+    // Fence the CLI off from privacy-protected folders, so macOS never shows a "would like to access
+    // your Desktop/Documents…" prompt on Headroom's behalf. /usage doesn't need any of them.
+    let sandbox = "/usr/bin/sandbox-exec"
+    if FileManager.default.isExecutableFile(atPath: sandbox) {
+        let fenced = ["Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Library/Mobile Documents"]
+            .map { "(subpath \"\(home.appendingPathComponent($0).path)\")" }.joined(separator: " ")
+        p.executableURL = URL(fileURLWithPath: sandbox)
+        p.arguments = ["-p", "(version 1)(allow default)(deny file-read* file-write* \(fenced))", bin] + claudeArgs
+    } else {
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = claudeArgs
+    }
     p.currentDirectoryURL = cwd
     var env = ["HOME": home.path, "USER": NSUserName(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin", "LANG": "en_US.UTF-8"]
     env["TMPDIR"] = ProcessInfo.processInfo.environment["TMPDIR"]
