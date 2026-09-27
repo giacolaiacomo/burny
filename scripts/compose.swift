@@ -82,8 +82,20 @@ func warmBackground(_ r: NSRect) {
               toCenter: NSPoint(x: r.width * 0.05, y: r.height), radius: r.width * 0.45, options: [])
 }
 
-func appIcon(_ path: String) -> NSImage? {
-    FileManager.default.fileExists(atPath: path) ? NSWorkspace.shared.icon(forFile: path) : nil
+/// A small progress ring in a service colour. The README images deliberately use no third-party logos.
+func ring(_ p: CGFloat, _ color: NSColor, in r: NSRect) {
+    let c = NSPoint(x: r.midX, y: r.midY), radius = r.width / 2 - 2
+    let track = NSBezierPath()
+    track.appendArc(withCenter: c, radius: radius, startAngle: 0, endAngle: 360)
+    track.lineWidth = 3
+    NSColor.white.withAlphaComponent(0.25).setStroke()
+    track.stroke()
+    let arc = NSBezierPath()   // flipped canvas: clockwise from 12 o'clock
+    arc.appendArc(withCenter: c, radius: radius, startAngle: -90, endAngle: -90 + 360 * p / 100, clockwise: false)
+    arc.lineWidth = 3
+    arc.lineCapStyle = .round
+    color.setStroke()
+    arc.stroke()
 }
 
 func symbol(_ name: String, _ size: CGFloat) -> NSImage? {
@@ -113,15 +125,15 @@ canvas(1280, 640, "hero.png") { r in
         drawImage(img, in: NSRect(x: x, y: (barH - img.size.height) / 2, width: img.size.width, height: img.size.height))
     }
     // Burny's item: two app icons with their percentages
-    let items: [(String, String)] = [("/Applications/Claude.app", barValues[0]), ("/Applications/ChatGPT.app", barValues[1])]
+    let items: [(NSColor, String)] = [(rgb(0xD97857), barValues[0]), (rgb(0x0FA37F), barValues[1])]
     let itemW = items.reduce(CGFloat(0)) { $0 + 18 + 5 + textWidth($1.1, size: 13.5, weight: .semibold) } + 12 + 16
     x -= itemW + 14
     let itemRect = NSRect(x: x, y: 3, width: itemW, height: barH - 6)
     NSColor.white.withAlphaComponent(0.20).setFill()
     NSBezierPath(roundedRect: itemRect, xRadius: 5, yRadius: 5).fill()
     var ix = itemRect.minX + 8
-    for (path, pct) in items {
-        if let a = appIcon(path) { drawImage(a, in: NSRect(x: ix, y: 5, width: 18, height: 18)) }
+    for (color, pct) in items {
+        ring(CGFloat(Double(pct.dropLast()) ?? 0), color, in: NSRect(x: ix, y: 5, width: 18, height: 18))
         ix += 18 + 5
         text(pct, at: NSPoint(x: ix, y: 5.5), size: 13.5, weight: .semibold)
         ix += textWidth(pct, size: 13.5, weight: .semibold) + 12

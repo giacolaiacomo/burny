@@ -1,0 +1,24 @@
+name: Bug report
+description: Something doesn't look right
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you see instead? A screenshot of the popover helps.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Burny version (bottom of Settings), macOS version, `claude --version`
+      placeholder: "Burny 1.0.0 · macOS 26.0 · claude 2.1.283"
+    validations:
+      required: true
+  - type: dropdown
+    id: service
+    attributes:
+      label: Which service?
+      options: [Claude Code, Codex, Both, Neither / the app itself]

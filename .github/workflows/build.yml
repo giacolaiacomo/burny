@@ -1,0 +1,15 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile
+        run: swiftc -Osize Sources/main.swift -o burny
+      - name: Smoke test (render the app icon)
+        run: ./burny --icon icon.png 256 && test -s icon.png

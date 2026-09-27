@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 command -v swiftc >/dev/null || { echo "swiftc not found — run: xcode-select --install"; exit 1; }
 
 APP="$HOME/Applications/Burny.app"
+VERSION=$(grep -m1 '^let appVersion' Sources/main.swift | cut -d'"' -f2)
 LABEL=com.burny.menubar
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 BUILD=$(mktemp -d)
@@ -32,7 +33,7 @@ cat > "$APP/Contents/Info.plist" <<PL
   <key>CFBundleExecutable</key><string>Burny</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
 </dict></plist>

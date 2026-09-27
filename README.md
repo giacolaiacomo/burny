@@ -3,6 +3,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/giacolaiacomo/burny/actions/workflows/build.yml"><img src="https://github.com/giacolaiacomo/burny/actions/workflows/build.yml/badge.svg" alt="Build"></a>
   <img src="https://img.shields.io/badge/macOS-13%2B-black?logo=apple" alt="macOS 13+">
   <img src="https://img.shields.io/badge/Swift-single%20file-F05138?logo=swift&logoColor=white" alt="Swift">
   <img src="https://img.shields.io/badge/RAM-~13%20MB-2ea44f" alt="~13 MB RAM">
@@ -32,7 +33,7 @@
 You need macOS 13+ and the Swift toolchain (`xcode-select --install`).
 
 ```sh
-git clone https://github.com/INAYA-GIA/burny.git
+git clone https://github.com/giacolaiacomo/burny.git
 cd burny
 ./install.sh
 ```
@@ -54,7 +55,7 @@ Because it only uses the vendors' own clients and files they already write on yo
 
 - **Claude Code**: `claude` installed and signed in with a subscription. Burny looks in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
 - **Codex**: the Codex CLI or app, used at least once.
-- The menu bar shows the Claude and ChatGPT app icons if those apps are in `/Applications`, otherwise a coloured ring.
+- The menu bar shows the icons of your locally installed Claude and ChatGPT apps if they're in `/Applications`, otherwise a coloured ring.
 
 ## Limitations
 

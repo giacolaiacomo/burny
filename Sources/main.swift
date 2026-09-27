@@ -9,6 +9,7 @@ import SwiftUI
 import Combine
 
 let bundleID = "com.burny.menubar"
+let appVersion = "1.0.0"   // install.sh reads this for Info.plist
 
 // MARK: Localization (English + Italian; add a language by adding a table)
 
@@ -628,6 +629,7 @@ struct SettingsView: View {
                     .labelsHidden().fixedSize()
                 }
             }
+            Text("Burny \(appVersion)").font(.system(size: 10.5)).foregroundStyle(.tertiary).frame(maxWidth: .infinity)
         }
     }
 }
