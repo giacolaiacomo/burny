@@ -12,7 +12,7 @@ import UserNotifications
 
 let bundleID = "com.burny.menubar"
 let repoSlug = "giacolaiacomo/burny"
-let appVersion = "1.2.0"   // install.sh reads this for Info.plist
+let appVersion = "1.3.0"   // install.sh reads this for Info.plist
 
 // MARK: Localization (English + Italian; add a language by adding a table)
 
@@ -86,6 +86,21 @@ let italian: [String: String] = [
     "% left": "% rimasta",
     "Time to reset": "Tempo al reset",
     "Icon only": "Solo icona",
+    "Where it went": "Dove sono finiti",
+    "Reading local logs…": "Leggo i log locali…",
+    "%d%% used · %@ tokens": "%d%% usato · %@ token",
+    "%@ tokens": "%@ token",
+    "≈ $%@ at API prices": "≈ $%@ a prezzi API",
+    "What the same usage would cost on the API, at list prices.": "Quanto costerebbe lo stesso utilizzo via API, a prezzi di listino.",
+    "%@ vs last week at this point": "%@ rispetto alla settimana scorsa a questo punto",
+    "No usage in this window.": "Nessun utilizzo in questa finestra.",
+    "Temporary folders": "Cartelle temporanee",
+    "Unknown": "Sconosciuto",
+    "Other": "Altro",
+    "Last 14 days": "Ultimi 14 giorni",
+    "today": "oggi",
+    "Estimated from Claude Code's and Codex's local logs, weighted by API price. The official % comes from the CLIs. Nothing leaves your Mac.":
+        "Stima dai log locali di Claude Code e Codex, pesata sui prezzi API. La % ufficiale viene dai client. Nulla esce dal Mac.",
 ]
 
 func tr(_ s: String) -> String { lang == "it" ? italian[s] ?? s : s }
@@ -389,6 +404,266 @@ func readCodex() -> Service? {
     return nil
 }
 
+// MARK: Where it went — token usage from the CLIs' own local logs
+//
+// Claude Code logs each reply with its token usage in ~/.claude/projects/**/*.jsonl; Codex logs token counts in
+// its session files. Burny adds these up per hour, project and model, weighted by API list price, to split the
+// official % by project. Only numbers, model names, timestamps and the project folder's name are kept. Each file
+// is read from where the last look stopped, the totals live in ~/Library/Caches/Burny/usage.json, and all of it
+// runs only while the breakdown is open.
+
+/// $ per million tokens: input, output, cache read. Cache writes cost 1.25× input (5 min) or 2× input (1 h).
+func claudePrice(_ model: String) -> (Double, Double, Double)? {
+    let m = model.lowercased()
+    guard m.hasPrefix("claude") else { return nil }   // e.g. "<synthetic>": not a real API call
+    if m.contains("fable") || m.contains("mythos") { return m.contains("5-1") ? (10, 50, 0.25) : (10, 50, 1) }
+    if m.contains("opus-5-5") { return (4, 20, 0.2) }
+    if m.contains("opus") { return (5, 25, 0.5) }
+    if m.contains("haiku") { return (1, 5, 0.1) }
+    return (3, 15, 0.3)   // Sonnet and anything newer
+}
+
+func claudeCost(model: String, usage u: [String: Any]) -> (cost: Double, tokens: Double)? {
+    guard let (i, o, r) = claudePrice(model) else { return nil }
+    func n(_ d: [String: Any], _ k: String) -> Double { (d[k] as? NSNumber)?.doubleValue ?? 0 }
+    let input = n(u, "input_tokens"), output = n(u, "output_tokens"), read = n(u, "cache_read_input_tokens")
+    let write = n(u, "cache_creation_input_tokens")
+    let write1h = min(write, n(u["cache_creation"] as? [String: Any] ?? [:], "ephemeral_1h_input_tokens"))
+    let cost = input * i + output * o + read * r + (write - write1h) * i * 1.25 + write1h * i * 2
+    return (cost / 1e6, input + output + read + write)
+}
+
+/// "claude-opus-5-5" → "Opus 5.5", "claude-haiku-4-5-20251001" → "Haiku 4.5", "gpt-6-astra" → "GPT-6 Astra".
+func modelName(_ id: String) -> String {
+    var parts = id.split(separator: "-").map(String.init)
+    if parts.first == "claude" { parts.removeFirst() }
+    if parts.last.map({ $0.count == 8 && Int($0) != nil }) == true { parts.removeLast() }
+    guard let family = parts.first else { return id }
+    if family == "gpt", parts.count > 1 {
+        return (["GPT-" + parts[1]] + parts.dropFirst(2).map(\.capitalized)).joined(separator: " ")
+    }
+    let rest = parts.dropFirst()
+    let version = rest.allSatisfy { Int($0) != nil } ? rest.joined(separator: ".") : rest.map(\.capitalized).joined(separator: " ")
+    return family.capitalized + (version.isEmpty ? "" : " " + version)
+}
+
+let tempProject = "(temp)"
+
+func projectName(_ cwd: String?) -> String {
+    guard var cwd, !cwd.isEmpty else { return "?" }
+    if let r = cwd.range(of: "/.claude/worktrees/") { cwd = String(cwd[..<r.lowerBound]) }   // agent worktrees count for their project
+    if ["/private/var/", "/var/folders/", "/tmp", "/private/tmp"].contains(where: cwd.hasPrefix) { return tempProject }
+    if cwd == home.path { return "~" }
+    return URL(fileURLWithPath: cwd).lastPathComponent
+}
+
+final class UsageLedger {
+    struct FileState: Codable {
+        var offset: UInt64 = 0
+        var lastID: String?, lastKey: String?, lastCost = 0.0, lastTokens = 0.0   // Claude: one reply is logged once per content block
+        var project: String?, model: String?, totals: [Double]?                    // Codex: session folder, model, running token totals
+    }
+    struct Saved: Codable {
+        var version = 2
+        var files: [String: FileState] = [:]
+        var buckets: [String: [Double]] = [:]   // "service\thour\tproject\tmodel" → [cost, tokens]
+    }
+    static let keepDays = 15.0
+
+    let claudeRoot: URL, codexRoot: URL, cacheURL: URL
+    var saved = Saved()
+    private let cutoff = Date().addingTimeInterval(-keepDays * 86400)
+    private let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    init(claudeRoot: URL = home.appendingPathComponent(".claude/projects"),
+         codexRoot: URL = home.appendingPathComponent(".codex/sessions"),
+         cacheURL: URL = home.appendingPathComponent("Library/Caches/Burny/usage.json")) {
+        self.claudeRoot = claudeRoot; self.codexRoot = codexRoot; self.cacheURL = cacheURL
+        if let d = try? Data(contentsOf: cacheURL), let s = try? JSONDecoder().decode(Saved.self, from: d), s.version == Saved().version {
+            saved = s
+        }
+    }
+
+    /// Reads whatever the logs gained since last time, drops data older than `keepDays`, saves.
+    func update() {
+        var seen = Set<String>()
+        for (service, root, needles) in [("Claude Code", claudeRoot, ["\"usage\":{"]),
+                                         ("Codex", codexRoot, ["\"token_count\"", "\"session_meta\"", "\"turn_context\""])] {
+            for (url, size) in logFiles(root) {
+                let path = url.path
+                seen.insert(path)
+                var st = saved.files[path] ?? FileState()
+                if size < st.offset { st = FileState() }   // file was rewritten: start over
+                guard size > st.offset else { saved.files[path] = st; continue }
+                st.offset = readLines(url, from: st.offset, needles: needles.map { Data($0.utf8) }) { line in
+                    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return }
+                    if service == "Codex" { codexLine(o, &st) } else { claudeLine(o, &st) }
+                }
+                saved.files[path] = st
+            }
+        }
+        saved.files = saved.files.filter { seen.contains($0.key) }
+        let oldest = Int(cutoff.timeIntervalSince1970 / hour)
+        saved.buckets = saved.buckets.filter { k, _ in Int(k.split(separator: "\t")[1]).map { $0 >= oldest } ?? false }
+        try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(saved).write(to: cacheURL, options: .atomic)
+    }
+
+    private func logFiles(_ root: URL) -> [(URL, UInt64)] {
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        guard let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else { return [] }
+        return e.compactMap { item in
+            guard let u = item as? URL, u.pathExtension == "jsonl", let v = try? u.resourceValues(forKeys: Set(keys)),
+                  (v.contentModificationDate ?? .distantPast) >= cutoff else { return nil }
+            return (u, UInt64(v.fileSize ?? 0))
+        }
+    }
+
+    /// Calls `line` for each complete line after `from` containing one of `needles`; returns the offset after the last full line.
+    private func readLines(_ url: URL, from: UInt64, needles: [Data], _ line: (Data) -> Void) -> UInt64 {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return from }
+        defer { try? h.close() }
+        try? h.seek(toOffset: from)
+        var offset = from, carry = Data()
+        while true {
+            let more: Bool = autoreleasepool {
+                guard let chunk = try? h.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
+                let buf = carry + chunk
+                var matches: [Data] = [], consumed = 0
+                buf.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    guard let base = raw.baseAddress else { return }
+                    while consumed < raw.count, let nl = memchr(base + consumed, 10, raw.count - consumed) {
+                        let end = base.distance(to: UnsafeRawPointer(nl))
+                        let hit = needles.contains { n in
+                            n.withUnsafeBytes { memmem(base + consumed, end - consumed, $0.baseAddress, n.count) != nil }
+                        }
+                        if hit { matches.append(Data(bytes: base + consumed, count: end - consumed)) }
+                        consumed = end + 1
+                    }
+                }
+                for m in matches { autoreleasepool { line(m) } }
+                offset += UInt64(consumed)
+                carry = buf.subdata(in: consumed..<buf.count)
+                return true
+            }
+            if !more { break }
+        }
+        return offset
+    }
+
+    private func add(_ key: String, _ cost: Double, _ tokens: Double) {
+        var b = saved.buckets[key] ?? [0, 0]
+        b[0] += cost; b[1] += tokens
+        saved.buckets[key] = b
+    }
+
+    private func key(_ service: String, _ at: Date, _ project: String, _ model: String) -> String {
+        "\(service)\t\(Int(at.timeIntervalSince1970 / hour))\t\(project)\t\(model)"
+    }
+
+    private let isoPlain = ISO8601DateFormatter()
+    private func date(_ v: Any?) -> Date? { (v as? String).flatMap { iso.date(from: $0) ?? isoPlain.date(from: $0) } }
+
+    private func claudeLine(_ o: [String: Any], _ st: inout FileState) {
+        guard o["type"] as? String == "assistant", let m = o["message"] as? [String: Any], let model = m["model"] as? String,
+              let u = m["usage"] as? [String: Any], let c = claudeCost(model: model, usage: u),
+              let at = date(o["timestamp"]), at >= cutoff else { return }
+        let id = m["id"] as? String
+        if let id, id == st.lastID, let k = st.lastKey {   // same reply again: keep only its latest numbers
+            add(k, c.cost - st.lastCost, c.tokens - st.lastTokens)
+        } else {
+            st.lastKey = key("Claude Code", at, projectName(o["cwd"] as? String), model)
+            add(st.lastKey!, c.cost, c.tokens)
+        }
+        st.lastID = id; st.lastCost = c.cost; st.lastTokens = c.tokens
+    }
+
+    private func codexLine(_ o: [String: Any], _ st: inout FileState) {
+        guard let p = o["payload"] as? [String: Any] else { return }
+        switch o["type"] as? String {
+        case "session_meta": st.project = projectName(p["cwd"] as? String)
+        case "turn_context": st.model = p["model"] as? String ?? st.model
+        default:
+            guard p["type"] as? String == "token_count", let info = p["info"] as? [String: Any],
+                  let t = info["total_token_usage"] as? [String: Any], let at = date(o["timestamp"]) else { return }
+            let now = ["input_tokens", "cached_input_tokens", "output_tokens"].map { (t[$0] as? NSNumber)?.doubleValue ?? 0 }
+            let prev = st.totals ?? [0, 0, 0]
+            st.totals = now
+            let d = now[0] >= prev[0] ? zip(now, prev).map { max(0, $0 - $1) } : now   // totals only grow within a session
+            guard at >= cutoff, d.contains(where: { $0 > 0 }) else { return }
+            // Relative weight at GPT list-price ratios (cached input 0.1×, output 8×); only shares are shown for Codex.
+            let cost = ((d[0] - d[1]) * 1.25 + d[1] * 0.125 + d[2] * 10) / 1e6
+            add(key("Codex", at, st.project ?? "?", st.model ?? "codex"), cost, d[0] + d[2])
+        }
+    }
+
+    /// Totals for a service between two dates, split by project and by model (largest first).
+    func split(_ service: String, from: Date, to: Date) -> (cost: Double, tokens: Double, projects: [(String, Double)], models: [(String, Double)]) {
+        let lo = Int(from.timeIntervalSince1970 / hour), hi = Int(to.timeIntervalSince1970 / hour)
+        var cost = 0.0, tokens = 0.0, projects: [String: Double] = [:], models: [String: Double] = [:]
+        for (k, v) in saved.buckets {
+            let f = k.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard f.count == 4, f[0] == service, let h = Int(f[1]), h >= lo, h <= hi else { continue }
+            cost += v[0]; tokens += v[1]
+            projects[f[2], default: 0] += v[0]
+            models[modelName(f[3]), default: 0] += v[0]
+        }
+        return (cost, tokens, projects.sorted { $0.value > $1.value }.map { ($0.key, $0.value) },
+                models.sorted { $0.value > $1.value }.map { ($0.key, $0.value) })
+    }
+
+    /// Cost per local day for the last `days` days, oldest first.
+    func daily(_ service: String, days: Int) -> [Double] {
+        let cal = Calendar.current, today = cal.startOfDay(for: Date())
+        var out = [Double](repeating: 0, count: days)
+        for (k, v) in saved.buckets {
+            let f = k.split(separator: "\t", omittingEmptySubsequences: false)
+            guard f.count == 4, f[0] == service, let h = Double(f[1]) else { continue }
+            let day = cal.dateComponents([.day], from: cal.startOfDay(for: Date(timeIntervalSince1970: h * hour)), to: today).day ?? days
+            if day >= 0 && day < days { out[days - 1 - day] += v[0] }
+        }
+        return out
+    }
+}
+
+/// What the breakdown page shows for one service and window.
+struct UsagePart: Identifiable {
+    let service: String
+    let percent: Double?              // the official % used in this window, when known
+    let cost: Double, tokens: Double
+    let projects: [(name: String, cost: Double)]
+    let models: [(name: String, cost: Double)]
+    let previous: Double?             // week only: cost at the same point of last week's window
+    let daily: [Double]               // week only: cost per day, last 14 days
+    var windowDays = 0                // how many of those days fall in the current week window
+    var id: String { service }
+}
+
+struct Breakdown {
+    var bySession: [UsagePart] = []
+    var byWeek: [UsagePart] = []
+
+    /// `windows`: per service, the start of the current session and week and their official % used.
+    init(_ ledger: UsageLedger, windows: [(service: String, session: (Date, Double?), week: (Date, Double?))]) {
+        for w in windows {
+            let now = Date()
+            let s = ledger.split(w.service, from: w.session.0, to: now), k = ledger.split(w.service, from: w.week.0, to: now)
+            let prev = ledger.split(w.service, from: w.week.0.addingTimeInterval(-week), to: now.addingTimeInterval(-week)).cost
+            bySession.append(UsagePart(service: w.service, percent: w.session.1, cost: s.cost, tokens: s.tokens,
+                                     projects: s.projects.map { ($0.0, $0.1) }, models: s.models.map { ($0.0, $0.1) }, previous: nil, daily: []))
+            byWeek.append(UsagePart(service: w.service, percent: w.week.1, cost: k.cost, tokens: k.tokens,
+                                       projects: k.projects.map { ($0.0, $0.1) }, models: k.models.map { ($0.0, $0.1) },
+                                       previous: prev > 0 ? prev : nil, daily: ledger.daily(w.service, days: 14),
+                                       windowDays: 1 + (Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: w.week.0),
+                                                                                        to: Calendar.current.startOfDay(for: now)).day ?? 6)))
+        }
+    }
+}
+
 // MARK: Open at login (the LaunchAgent written by install.sh)
 
 enum LoginItem {
@@ -458,6 +733,39 @@ final class Store: ObservableObject {
     }
     @Published var update: (version: String, url: URL)?
     @Published var upToDate = false
+
+    @Published var breakdown: Breakdown?
+    @Published var readingLogs = false
+
+    /// Each service's current session and week start, from the official limits (or the last 5 h / 7 days).
+    func usageWindows() -> [(service: String, session: (Date, Double?), week: (Date, Double?))] {
+        [claude, codex].enumerated().map { i, s in
+            func window(_ match: (Kind) -> Bool, _ length: TimeInterval) -> (Date, Double?) {
+                if let l = s?.limits.first(where: { match($0.kind) }), let r = l.resetsAt, r > Date() { return (r.addingTimeInterval(-l.window), l.effective) }
+                return (Date().addingTimeInterval(-length), nil)
+            }
+            return (i == 0 ? "Claude Code" : "Codex",
+                    window({ if case .session = $0 { return true }; return false }, 5 * hour),
+                    window({ $0 == .week(model: "all models") || $0 == .week(model: nil) }, week))
+        }
+    }
+
+    func loadBreakdown() {
+        guard !readingLogs else { return }
+        readingLogs = true
+        let windows = usageWindows()
+        DispatchQueue.global(qos: .utility).async {
+            // The log scan runs in a short-lived child process, so the memory it needs goes away when it exits.
+            let p = Process()
+            p.executableURL = Bundle.main.executableURL
+            p.arguments = ["--usage-scan"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            if (try? p.run()) != nil { p.waitUntilExit() }
+            let b = autoreleasepool { Breakdown(UsageLedger(), windows: windows) }
+            DispatchQueue.main.async { self.breakdown = b; self.readingLogs = false }
+        }
+    }
 
     private var fetched: (limits: [Limit], at: Date)?
     private var plan: String?
@@ -712,26 +1020,32 @@ struct ServiceCard: View {
     }
 }
 
+enum Page { case limits, breakdown, settings }
+
 struct UsageView: View {
     @ObservedObject var store: Store
-    @State var settings = false
+    @State var page = Page.limits
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                if settings {
-                    Button { settings = false } label: { Image(systemName: "chevron.left") }.buttonStyle(.borderless)
+                if page != .limits {
+                    Button { page = .limits } label: { Image(systemName: "chevron.left") }.buttonStyle(.borderless)
                 }
-                Text(tr(settings ? "Settings" : "Usage limits")).font(.system(size: 14, weight: .bold))
+                Text(tr(page == .settings ? "Settings" : page == .breakdown ? "Where it went" : "Usage limits")).font(.system(size: 14, weight: .bold))
                 Spacer()
-                if !settings {
+                if page == .limits {
                     if store.fetching { ProgressView().controlSize(.small).scaleEffect(0.8) }
                     Button { store.fetch() } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless).help(tr("Refresh now"))
-                    Button { settings = true } label: { Image(systemName: "gearshape") }
+                    Button { page = .breakdown } label: { Image(systemName: "chart.pie") }
+                        .buttonStyle(.borderless).help(tr("Where it went"))
+                    Button { page = .settings } label: { Image(systemName: "gearshape") }
                         .buttonStyle(.borderless).help(tr("Settings"))
+                } else if page == .breakdown && store.readingLogs {
+                    ProgressView().controlSize(.small).scaleEffect(0.8)
                 }
             }
-            if let u = store.update, !settings {
+            if let u = store.update, page == .limits {
                 HStack {
                     Image(systemName: "arrow.down.circle.fill").foregroundStyle(.orange)
                     Text(String(format: tr("Burny %@ is available"), u.version)).font(.system(size: 12, weight: .medium))
@@ -741,8 +1055,10 @@ struct UsageView: View {
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.12)))
             }
-            if settings {
+            if page == .settings {
                 SettingsView(store: store)
+            } else if page == .breakdown {
+                BreakdownView(store: store)
             } else {
                 ServiceCard(service: store.claude, name: "Claude Code", accent: claudeAccent)
                 ServiceCard(service: store.codex, name: "Codex", accent: codexAccent)
@@ -761,6 +1077,135 @@ struct UsageView: View {
         .padding(16)
         .frame(width: 330)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+func tokenCount(_ t: Double) -> String {
+    t >= 1e9 ? String(format: "%.1fB", t / 1e9) : t >= 1e6 ? String(format: "%.1fM", t / 1e6) : t >= 1e3 ? String(format: "%.0fK", t / 1e3) : String(Int(t))
+}
+
+struct BreakdownView: View {
+    @ObservedObject var store: Store
+    @State var tab = "week"
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("", selection: $tab) {
+                Text(tr("Session")).tag("session")
+                Text(tr("Week")).tag("week")
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            if let b = store.breakdown {
+                ForEach(tab == "week" ? b.byWeek : b.bySession) { part in
+                    PartCard(part: part, accent: part.service == "Codex" ? codexAccent : claudeAccent, isWeek: tab == "week")
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(tr("Reading local logs…")).font(.system(size: 11.5)).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 80)
+            }
+            Text(tr("Estimated from Claude Code's and Codex's local logs, weighted by API price. The official % comes from the CLIs. Nothing leaves your Mac."))
+                .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+        }
+        .onAppear { store.loadBreakdown() }
+    }
+}
+
+struct PartCard: View {
+    let part: UsagePart
+    let accent: Color
+    let isWeek: Bool
+
+    func label(_ name: String) -> String { name == tempProject ? tr("Temporary folders") : name == "?" ? tr("Unknown") : name }
+
+    /// The top projects, the rest folded into "Other"; each with its share of the cost.
+    var rows: [(name: String, share: Double)] {
+        guard part.cost > 0 else { return [] }
+        var r = part.projects.prefix(5).map { (label($0.name), $0.cost / part.cost) }
+        let rest = part.projects.dropFirst(5).reduce(0) { $0 + $1.cost }
+        if rest > 0 { r.append((tr("Other"), rest / part.cost)) }
+        return r
+    }
+
+    /// With the official % known, a project's share is shown as points of that limit (they add up to the official %).
+    func value(_ share: Double) -> String {
+        let v = share * (part.percent ?? 100)
+        return v < 1 ? "<1%" : (part.percent == nil ? "" : "≈ ") + "\(Int(v.rounded()))%"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 7) {
+                Circle().fill(accent).frame(width: 8, height: 8)
+                Text(part.service).font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if part.service == "Claude Code" && part.cost > 0 {
+                    Text(String(format: tr("≈ $%@ at API prices"), String(format: "%.2f", part.cost)))
+                        .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                        .help(tr("What the same usage would cost on the API, at list prices."))
+                }
+            }
+            if part.cost <= 0 {
+                Text(tr("No usage in this window.")).font(.system(size: 11.5)).foregroundStyle(.secondary)
+            } else {
+                Group {
+                    if let p = part.percent {
+                        Text(String(format: tr("%d%% used · %@ tokens"), Int(p.rounded()), tokenCount(part.tokens)))
+                    } else {
+                        Text(String(format: tr("%@ tokens"), tokenCount(part.tokens)))
+                    }
+                }
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                if isWeek, let prev = part.previous {
+                    let delta = (part.cost / prev - 1) * 100
+                    Label(String(format: tr("%@ vs last week at this point"), (delta >= 0 ? "+" : "") + "\(Int(delta.rounded()))%"),
+                          systemImage: delta >= 0 ? "arrow.up.right" : "arrow.down.right")
+                        .font(.system(size: 10.5, weight: .medium)).foregroundStyle(delta > 15 ? Color.orange : Color.secondary)
+                }
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(rows, id: \.name) { row in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(row.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+                                Spacer()
+                                Text(value(row.share)).font(.system(size: 12, weight: .semibold, design: .rounded)).monospacedDigit()
+                            }
+                            GeometryReader { g in
+                                ZStack(alignment: .leading) {
+                                    Capsule().fill(Color.primary.opacity(0.08))
+                                    Capsule().fill(accent.opacity(0.8)).frame(width: max(3, g.size.width * row.share))
+                                }
+                            }
+                            .frame(height: 4)
+                        }
+                    }
+                }
+                Text(part.models.map { "\($0.name) \(Int(($0.cost / part.cost * 100).rounded()))%" }.joined(separator: " · "))
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if isWeek && part.daily.contains(where: { $0 > 0 }) {
+                    let top = part.daily.max() ?? 1
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .bottom, spacing: 3) {
+                            ForEach(Array(part.daily.enumerated()), id: \.offset) { i, v in
+                                RoundedRectangle(cornerRadius: 1.5)
+                                    .fill(i >= 14 - part.windowDays ? accent.opacity(i == 13 ? 1 : 0.7) : Color.primary.opacity(0.18))
+                                    .frame(height: max(2, 30 * v / top))
+                            }
+                        }
+                        .frame(height: 30, alignment: .bottom)
+                        HStack {
+                            Text(tr("Last 14 days"))
+                            Spacer()
+                            Text(tr("today"))
+                        }
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.055)))
     }
 }
 
@@ -1066,7 +1511,8 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 //
 // Dev helpers:  --self-test                                checks the parsers (run by CI)
 //               --icon out.png [px]                        renders the app icon
-//               --snapshot out.png [dark] [settings] [en|it]  renders the popover with live data
+//               --snapshot out.png [dark] [settings|breakdown] [en|it]  renders the popover with live data
+//               --usage-log [days]                         prints the per-project split of the local logs
 
 let args = CommandLine.arguments
 func png(_ rep: NSBitmapImageRep, _ path: String) {
@@ -1122,10 +1568,56 @@ if args.contains("--self-test") {
         Limit(kind: .week(model: "Fable"), percent: 93, resetsAt: nil, window: week)], updated: nil)
     check(fable.switchHint?.limit.kind == .week(model: "Fable"), "hint: switch model when one bucket is nearly used up")
     check(compactUntil(Date().addingTimeInterval(3 * hour + 5 * 60 + 30)) == "3h05", "menu bar: compact countdown")
+    check(modelName("claude-opus-5-5") == "Opus 5.5" && modelName("claude-haiku-4-5-20251001") == "Haiku 4.5"
+          && modelName("gpt-6-astra") == "GPT-6 Astra" && modelName("codex-auto-review") == "Codex Auto Review", "breakdown: model names")
+    check(projectName("/Users/x/Projects/app/.claude/worktrees/agent-1") == "app" && projectName("/private/var/folders/a/T/tmp.x") == tempProject,
+          "breakdown: project names")
+    // A reply logged twice (once per content block) must count once, and a second read must only add new lines.
+    let ldir = FileManager.default.temporaryDirectory.appendingPathComponent("burny-ledger-\(getpid())")
+    try? FileManager.default.createDirectory(at: ldir.appendingPathComponent("claude/p"), withIntermediateDirectories: true)
+    let ts = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-60))
+    func reply(_ id: String, _ out: Int) -> String {
+        #"{"type":"assistant","timestamp":"\#(ts)","cwd":"/Users/x/demo","message":{"id":"\#(id)","model":"claude-sonnet-5","usage":{"input_tokens":1000000,"output_tokens":\#(out)}}}"#
+    }
+    let clog = ldir.appendingPathComponent("claude/p/s.jsonl")
+    try? ([reply("a", 0), reply("a", 1_000_000), #"{"type":"user"}"#].joined(separator: "\n") + "\n").write(to: clog, atomically: true, encoding: .utf8)
+    let ledger = UsageLedger(claudeRoot: ldir.appendingPathComponent("claude"), codexRoot: ldir.appendingPathComponent("codex"),
+                             cacheURL: ldir.appendingPathComponent("usage.json"))
+    ledger.update()
+    check(abs(ledger.split("Claude Code", from: Date().addingTimeInterval(-hour), to: Date()).cost - 18) < 0.001, "breakdown: duplicate reply counted once ($3 in + $15 out)")
+    if let h = try? FileHandle(forWritingTo: clog) { h.seekToEndOfFile(); h.write(Data((reply("b", 0) + "\n").utf8)); try? h.close() }
+    let again = UsageLedger(claudeRoot: ldir.appendingPathComponent("claude"), codexRoot: ldir.appendingPathComponent("codex"),
+                            cacheURL: ldir.appendingPathComponent("usage.json"))
+    again.update()
+    let after = again.split("Claude Code", from: Date().addingTimeInterval(-hour), to: Date())
+    check(abs(after.cost - 21) < 0.001 && after.projects.first?.0 == "demo", "breakdown: incremental read from the cache")
+    try? FileManager.default.removeItem(at: ldir)
     check(isNewer("1.10.0", than: "1.9.2") && !isNewer("1.1.0", than: "1.1.0") && !isNewer("1.0.9", than: "1.1"), "update: version comparison")
 
     print(failures == 0 ? "all checks passed" : "\(failures) check(s) failed")
     exit(failures == 0 ? 0 : 1)
+}
+
+// `Burny --usage-scan` updates the usage cache from the logs and exits; the app runs it as a child process.
+if args.contains("--usage-scan") {
+    UsageLedger().update()
+    exit(0)
+}
+
+// `Burny --usage-log [days]` prints the per-project split of the local logs, for checking the numbers by hand.
+if let i = args.firstIndex(of: "--usage-log") {
+    let days = i + 1 < args.count ? Double(args[i + 1]) ?? 7 : 7
+    let start = Date()
+    let ledger = UsageLedger()
+    ledger.update()
+    print(String(format: "read in %.1f s", -start.timeIntervalSinceNow))
+    for service in ["Claude Code", "Codex"] {
+        let s = ledger.split(service, from: Date().addingTimeInterval(-days * 86400), to: Date())
+        print(String(format: "%@: %.2f (API $ for Claude), %.0f tokens", service, s.cost, s.tokens))
+        for (name, c) in s.projects.prefix(8) { print(String(format: "  %5.1f%%  %@", c / max(s.cost, 1e-9) * 100, name)) }
+        for (name, c) in s.models { print(String(format: "  %5.1f%%  [%@]", c / max(s.cost, 1e-9) * 100, name)) }
+    }
+    exit(0)
 }
 
 if let i = args.firstIndex(of: "--icon"), i + 1 < args.count {
@@ -1141,7 +1633,13 @@ if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
         if let l = fetchClaudeUsage() { store.claude = Service(name: "Claude Code", plan: claudePlan(), limits: l, updated: Date()) }
         // Menu bar values, for the README composer: "<claude> <codex>"
         print([store.claude, store.codex].map { store.barValue($0).map { "\(Int($0.rounded()))%" } ?? "–" }.joined(separator: " "))
-        let host = NSHostingView(rootView: UsageView(store: store, settings: args.contains("settings")))
+        if args.contains("breakdown") {
+            let ledger = UsageLedger()
+            ledger.update()
+            store.breakdown = Breakdown(ledger, windows: store.usageWindows())
+        }
+        let page: Page = args.contains("settings") ? .settings : args.contains("breakdown") ? .breakdown : .limits
+        let host = NSHostingView(rootView: UsageView(store: store, page: page))
         host.frame.size = host.fittingSize
         let win = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
         win.appearance = NSAppearance(named: args.contains("dark") ? .darkAqua : .aqua)

@@ -21,6 +21,13 @@ To read your Claude limits, Burny runs the official CLI's own `/usage` command, 
 
 Burny reads the newest `~/.codex/sessions/**/rollout-*.jsonl` files backwards and parses only the `rate_limits` object of the most recent `token_count` event. It reads them only; nothing is written or sent anywhere.
 
+## "Where it went" breakdown
+
+The breakdown page reads the logs Claude Code (`~/.claude/projects/**/*.jsonl`) and Codex (`~/.codex/sessions/`) already keep on your Mac. From each reply it keeps only numbers: token counts, the model name, the timestamp and the name of the project folder. Lines are parsed in memory, and message text is never stored, shown or sent.
+- The totals, per hour, project and model, are cached in `~/Library/Caches/Burny/usage.json` and cover the last 15 days.
+- Each look reads only the bytes added since the previous one.
+- The reading runs in a short-lived child process of Burny, and only when you open the page.
+
 ## Update check (optional, off by default)
 
 If you turn on **Check for updates**, Burny sends at most one request a day to `https://api.github.com/repos/giacolaiacomo/burny/releases/latest`. It uses an ephemeral session with no cookies, and the only identifying header is `User-Agent: Burny/<version>`. If a newer version exists, Burny shows a link to the release page. It never downloads or installs anything by itself; you update with `git pull && ./install.sh`.
@@ -32,6 +39,6 @@ If you turn on **Check for updates**, Burny sends at most one request a day to `
 - Call private or undocumented endpoints.
 - Send telemetry, or write anything outside `~/Library/Preferences/com.burny.menubar.plist` and `~/Library/Caches/Burny`.
 
-The whole app is one ~800-line file, [`Sources/main.swift`](Sources/main.swift), so you can read all of it before you build it. You always build it from source yourself; no prebuilt binaries are distributed.
+The whole app is one ~1,700-line file, [`Sources/main.swift`](Sources/main.swift), so you can read all of it before you build it. You always build it from source yourself; no prebuilt binaries are distributed.
 
 To report a problem, please open an issue.

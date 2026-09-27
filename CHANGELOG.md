@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 — 2026-09-27
+
+- **Where it went:** a new page (the pie-chart button) splits your session and week by project and by model. It's estimated from the token counts Claude Code and Codex already log locally, weighted by API price and scaled to the official %. Claude Code agent worktrees count toward their project.
+- A 14-day chart per service, the change against last week at the same point, and the API-price equivalent of your Claude Code usage.
+- Only the bytes added since the last look are read. Totals are cached in `~/Library/Caches/Burny/usage.json`, and the reading runs in a short-lived child process, so the app's memory stays small.
+- `--usage-log [days]` prints the split, for checking it by hand.
+
 ## 1.2.0 — 2026-09-27
 
 - **"You're good to go" alert:** when a limit passes 90%, Burny schedules a notification for the moment it resets. macOS delivers it even if Burny isn't running by then.
