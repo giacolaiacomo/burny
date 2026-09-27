@@ -125,13 +125,24 @@ func claudeBinary() -> String? {
 }
 
 /// Only ever run the genuine CLI: its code signature must chain to Apple and belong to Anthropic's team.
+/// Verifying hashes the whole ~200 MB binary, so it's done once per binary (path + modification date).
+private var verifiedClaude: (path: String, mtime: Date)?
+
 func isGenuineClaude(_ path: String) -> Bool {
-    var code: SecStaticCode?, req: SecRequirement?
-    let url = URL(fileURLWithPath: path).resolvingSymlinksInPath() as CFURL
-    guard SecStaticCodeCreateWithPath(url, [], &code) == errSecSuccess, let code,
-          SecRequirementCreateWithString("anchor apple generic and certificate leaf[subject.OU] = \"Q6L2SF6YDW\"" as CFString, [], &req) == errSecSuccess,
-          let req else { return false }
-    return SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), req) == errSecSuccess
+    let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+    let stamp = (resolved.path, mtime(resolved))
+    if let v = verifiedClaude, v == stamp { return true }
+    // Apple's own codesign tool does the check in a short-lived process, so its buffers don't stay in Burny's memory.
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    p.arguments = ["--verify", "-R=anchor apple generic and certificate leaf[subject.OU] = \"Q6L2SF6YDW\"", resolved.path]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return false }
+    p.waitUntilExit()
+    let ok = p.terminationStatus == 0
+    if ok { verifiedClaude = stamp }
+    return ok
 }
 
 enum ClaudeStatus { case ok, notInstalled, notGenuine, unexpectedOutput }
