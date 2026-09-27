@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="docs/icon.png" width="128" alt="Headroom icon">
+  <img src="docs/icon.png" width="128" alt="Burny icon">
 </p>
 
-<h1 align="center">Headroom</h1>
+<h1 align="center">Burny</h1>
 
 <p align="center">
-  <b>Know how much room you have left.</b><br>
+  <b>See how fast you are burning through your AI plan.</b><br>
   Your Claude Code and Codex plan limits, live in the macOS menu bar.
 </p>
 
@@ -43,49 +43,49 @@
 You need macOS 13+ and the Swift toolchain (`xcode-select --install`).
 
 ```sh
-git clone https://github.com/INAYA-GIA/headroom.git
-cd headroom
+git clone https://github.com/INAYA-GIA/burny.git
+cd burny
 ./install.sh
 ```
 
-This builds `~/Applications/Headroom.app` and registers it to start at login. To remove it: `./uninstall.sh`.
+This builds `~/Applications/Burny.app` and registers it to start at login. To remove it: `./uninstall.sh`.
 
 ## How it gets the data, and why it's safe
 
-Headroom **makes no network requests, never reads tokens or passwords, and never spends your quota.**
+Burny **makes no network requests, never reads tokens or passwords, and never spends your quota.**
 
 | | Source | How often |
 |---|---|---|
-| **Claude Code** | Runs the official CLI: `claude -p /usage`. It's exactly what typing `/usage` does: 0 tokens, $0, with hooks disabled, no session saved, and sandboxed away from your personal folders. | Every 5 min (configurable) and when you open the popover |
+| **Claude Code** | Runs the official CLI's local `/usage` command: the model is never called, so it costs 0 tokens and $0. The binary's Anthropic signature is checked first, and the call runs with no tools, no MCP servers, no hooks and sandboxed away from your personal folders. | Every 5 min (configurable) and when you open the popover |
 | **Codex** | Reads the `rate_limits` the Codex CLI already writes to `~/.codex/sessions/`. It only reads the tail of the newest log, in small chunks. | Every 30 s, local disk only |
 
 Because it only uses the vendors' own clients and files they already write on your Mac, nothing looks different to Anthropic or OpenAI than you using their tools normally. The Claude plan badge (Pro / Max) is read from `~/.claude.json`. See [SECURITY.md](SECURITY.md) for the full picture.
 
 ## Requirements
 
-- **Claude Code**: `claude` installed and signed in with a subscription. Headroom looks in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
+- **Claude Code**: `claude` installed and signed in with a subscription. Burny looks in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
 - **Codex**: the Codex CLI or app, used at least once.
 - The menu bar shows the Claude and ChatGPT app icons if those apps are in `/Applications`, otherwise a coloured ring.
 
 ## Limitations
 
 - Codex numbers are as fresh as your last Codex response, because Codex only logs them when you use it.
-- ChatGPT chat message limits aren't stored locally, so they aren't shown. Getting them would mean scraping the website with your session, which is exactly what Headroom avoids.
-- The popover's wording follows the Claude CLI's `/usage` output. If a future CLI changes that format, the Claude card may go empty until Headroom is updated.
+- ChatGPT chat message limits aren't stored locally, so they aren't shown. Getting them would mean scraping the website with your session, which is exactly what Burny avoids.
+- The popover's wording follows the Claude CLI's `/usage` output. If a future CLI changes that format, the Claude card may go empty until Burny is updated.
 
 ## Development
 
 ```sh
-swiftc -Osize Sources/main.swift -o /tmp/headroom
-/tmp/headroom --snapshot out.png dark en     # render the popover (add: settings, it)
-/tmp/headroom --icon icon.png 1024           # render the app icon
+swiftc -Osize Sources/main.swift -o /tmp/burny
+/tmp/burny --snapshot out.png dark en     # render the popover (add: settings, it)
+/tmp/burny --icon icon.png 1024           # render the app icon
 ```
 
 Adding a language means adding a string table next to `italian` in `Sources/main.swift`.
 
 ## Disclaimer
 
-Headroom is an independent project, not affiliated with or endorsed by Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC; ChatGPT and Codex are trademarks of OpenAI.
+Burny is an independent project, not affiliated with or endorsed by Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC; ChatGPT and Codex are trademarks of OpenAI.
 
 ## License
 

@@ -1,4 +1,4 @@
-// Headroom — a tiny macOS menu bar app showing your Claude Code and Codex (ChatGPT) plan limits.
+// Burny — a tiny macOS menu bar app showing your Claude Code and Codex (ChatGPT) plan limits.
 //
 // It makes no network calls of its own and never touches credentials:
 //   Claude Code: runs the official `claude -p /usage` (0 tokens — the same request as typing /usage)
@@ -8,7 +8,7 @@ import AppKit
 import SwiftUI
 import Combine
 
-let bundleID = "com.headroom.menubar"
+let bundleID = "com.burny.menubar"
 
 // MARK: Localization (English + Italian; add a language by adding a table)
 
@@ -26,6 +26,10 @@ let italian: [String: String] = [
     "Local data and official clients only": "Solo dati locali e client ufficiali",
     "Quit": "Esci",
     "No data yet — use it once and it will show up here.": "Nessun dato: usalo una volta e comparirà qui.",
+    "Claude Code CLI not found.": "CLI di Claude Code non trovata.",
+    "The claude binary isn't signed by Anthropic, so Burny won't run it.": "Il binario claude non è firmato da Anthropic: Burny non lo esegue.",
+    "The claude CLI answered unexpectedly, so Burny stopped calling it. Restart Burny after updating.":
+        "La CLI claude ha risposto in modo inatteso: Burny ha smesso di chiamarla. Riavvia Burny dopo un aggiornamento.",
     "Session": "Sessione",
     "Week": "Settimana",
     "all models": "tutti i modelli",
@@ -120,16 +124,37 @@ func claudeBinary() -> String? {
         .first { FileManager.default.isExecutableFile(atPath: $0) }
 }
 
+/// Only ever run the genuine CLI: its code signature must chain to Apple and belong to Anthropic's team.
+func isGenuineClaude(_ path: String) -> Bool {
+    var code: SecStaticCode?, req: SecRequirement?
+    let url = URL(fileURLWithPath: path).resolvingSymlinksInPath() as CFURL
+    guard SecStaticCodeCreateWithPath(url, [], &code) == errSecSuccess, let code,
+          SecRequirementCreateWithString("anchor apple generic and certificate leaf[subject.OU] = \"Q6L2SF6YDW\"" as CFString, [], &req) == errSecSuccess,
+          let req else { return false }
+    return SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), req) == errSecSuccess
+}
+
+enum ClaudeStatus { case ok, notInstalled, notGenuine, unexpectedOutput }
+var claudeStatus = ClaudeStatus.ok
+
+/// Runs the official `/usage` slash command in a locked-down CLI. Defense in depth — any one layer is enough:
+///  - the input is a constant local command, never text from anywhere else, and the model is never called;
+///  - no tools, no MCP servers, no settings/hooks/CLAUDE.md, $0.0001 spending cap, no saved session;
+///  - sandboxed away from personal folders; minimal environment;
+///  - the output must prove no model turn happened (0 turns, $0, 0 ms API), else Burny stops calling it;
+///  - from the output only numbers and dates are extracted with a strict regex; nothing is ever executed.
 func fetchClaudeUsage() -> [Limit]? {
-    guard let bin = claudeBinary() else { return nil }
-    let cwd = home.appendingPathComponent("Library/Caches/Headroom")
+    guard let bin = claudeBinary() else { claudeStatus = .notInstalled; return nil }
+    guard isGenuineClaude(bin) else { claudeStatus = .notGenuine; return nil }
+    let cwd = home.appendingPathComponent("Library/Caches/Burny")
     try? FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
     let p = Process()
-    // No hooks, no saved session, only the user's own settings: nothing but the /usage request.
     let claudeArgs = ["-p", "/usage", "--output-format", "json", "--no-session-persistence",
-                      "--setting-sources", "user", "--settings", "{\"disableAllHooks\":true}"]
+                      "--setting-sources", "", "--settings", "{\"disableAllHooks\":true}",
+                      "--tools", "", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
+                      "--max-budget-usd", "0.0001"]
     // Fence the CLI off from privacy-protected folders, so macOS never shows a "would like to access
-    // your Desktop/Documents…" prompt on Headroom's behalf. /usage doesn't need any of them.
+    // your Desktop/Documents…" prompt on Burny's behalf. /usage doesn't need any of them.
     let sandbox = "/usr/bin/sandbox-exec"
     if FileManager.default.isExecutableFile(atPath: sandbox) {
         let fenced = ["Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Library/Mobile Documents"]
@@ -141,7 +166,7 @@ func fetchClaudeUsage() -> [Limit]? {
         p.arguments = claudeArgs
     }
     p.currentDirectoryURL = cwd
-    var env = ["HOME": home.path, "USER": NSUserName(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin", "LANG": "en_US.UTF-8"]
+    var env = ["HOME": home.path, "USER": NSUserName(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"]
     env["TMPDIR"] = ProcessInfo.processInfo.environment["TMPDIR"]
     p.environment = env
     p.standardInput = FileHandle.nullDevice
@@ -156,8 +181,12 @@ func fetchClaudeUsage() -> [Limit]? {
     killer.cancel()
     guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           (obj["is_error"] as? Bool) != true, let text = obj["result"] as? String else { return nil }
+    let noModel = (obj["num_turns"] as? NSNumber)?.intValue == 0 && (obj["total_cost_usd"] as? NSNumber)?.doubleValue == 0
+        && (obj["duration_api_ms"] as? NSNumber)?.intValue == 0
     let limits = parseUsage(text)
-    return limits.isEmpty ? nil : limits
+    guard noModel, !limits.isEmpty else { claudeStatus = .unexpectedOutput; return nil }   // CLI changed: stop, don't retry
+    claudeStatus = .ok
+    return limits
 }
 
 // "Current week (Fable): 6% used · resets Oct 3 at 2pm (Europe/Rome)"
@@ -363,7 +392,7 @@ final class Store: ObservableObject {
     }
 
     func fetch(ifOlderThan age: TimeInterval = 0) {
-        if fetching { return }
+        if fetching || claudeStatus == .unexpectedOutput || claudeStatus == .notGenuine { return }
         if let f = fetched, -f.at.timeIntervalSinceNow < age { return }
         fetching = true
         DispatchQueue.global(qos: .utility).async {
@@ -434,6 +463,15 @@ struct ServiceCard: View {
     let service: Service?
     let name: String
     let accent: Color
+    var emptyMessage: String {
+        guard name == "Claude Code" else { return "No data yet — use it once and it will show up here." }
+        switch claudeStatus {
+        case .notInstalled: return "Claude Code CLI not found."
+        case .notGenuine: return "The claude binary isn't signed by Anthropic, so Burny won't run it."
+        case .unexpectedOutput: return "The claude CLI answered unexpectedly, so Burny stopped calling it. Restart Burny after updating."
+        case .ok: return "No data yet — use it once and it will show up here."
+        }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 7) {
@@ -450,7 +488,7 @@ struct ServiceCard: View {
             if let s = service, !s.limits.isEmpty {
                 ForEach(s.limits) { LimitRow(limit: $0, accent: accent) }
             } else {
-                Text(tr("No data yet — use it once and it will show up here.")).font(.system(size: 11.5)).foregroundStyle(.secondary)
+                Text(tr(emptyMessage)).font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(14)
@@ -703,7 +741,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         if title.length == 0 {   // both hidden: keep a clickable glyph
             let att = NSTextAttachment()
-            att.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "Headroom")
+            att.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "Burny")
             title.append(NSAttributedString(attachment: att))
         }
         item.button?.attributedTitle = title
