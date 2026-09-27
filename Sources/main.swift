@@ -654,38 +654,77 @@ func ring(_ p: Double?, _ accent: NSColor) -> NSImage {
     }
 }
 
-/// The app icon: two concentric gauges (Claude orange, Codex green) on a dark squircle.
+/// The app icon: Burny, a little flame with eyes, on a warm dark squircle.
 func drawAppIcon(px: Int) -> NSBitmapImageRep? {
     guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8, samplesPerPixel: 4,
                                      hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
     else { return nil }
     let s = CGFloat(px)
+    func rgb(_ hex: Int, _ a: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: CGFloat(hex >> 16 & 255) / 255, green: CGFloat(hex >> 8 & 255) / 255, blue: CGFloat(hex & 255) / 255, alpha: a)
+    }
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     let body = NSRect(x: s * 0.1, y: s * 0.1, width: s * 0.8, height: s * 0.8)   // Apple icon grid margin
     let squircle = NSBezierPath(roundedRect: body, xRadius: s * 0.18, yRadius: s * 0.18)
-    NSGradient(starting: NSColor(red: 0.16, green: 0.18, blue: 0.24, alpha: 1), ending: NSColor(red: 0.07, green: 0.08, blue: 0.11, alpha: 1))?
-        .draw(in: squircle, angle: -90)
-    let c = NSPoint(x: body.midX, y: body.midY - s * 0.01)
-    func gauge(radius: CGFloat, width: CGFloat, fraction: CGFloat, color: NSColor) {
-        let start: CGFloat = 225, sweep: CGFloat = 270   // open at the bottom, like a speedometer
-        let track = NSBezierPath()
-        track.appendArc(withCenter: c, radius: radius, startAngle: start, endAngle: start - sweep, clockwise: true)
-        track.lineWidth = width
-        track.lineCapStyle = .round
-        NSColor.white.withAlphaComponent(0.10).setStroke()
-        track.stroke()
-        let arc = NSBezierPath()
-        arc.appendArc(withCenter: c, radius: radius, startAngle: start, endAngle: start - sweep * fraction, clockwise: true)
-        arc.lineWidth = width
-        arc.lineCapStyle = .round
-        color.setStroke()
-        arc.stroke()
+    NSGradient(starting: rgb(0x2B1B18), ending: rgb(0x120B0A))?.draw(in: squircle, angle: -90)
+    squircle.addClip()
+    NSGradient(colors: [rgb(0xFF6A1F, 0.38), rgb(0xFF6A1F, 0)])?   // warm glow behind the flame
+        .draw(fromCenter: NSPoint(x: body.midX, y: body.minY + body.height * 0.36), radius: 0,
+              toCenter: NSPoint(x: body.midX, y: body.minY + body.height * 0.36), radius: body.width * 0.55, options: [])
+
+    // Flame paths in unit coordinates inside a box slightly smaller than the body.
+    let box = body.insetBy(dx: body.width * 0.12, dy: body.height * 0.08)
+    func pt(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: box.minX + x * box.width, y: box.minY + y * box.height) }
+    func path(_ start: (CGFloat, CGFloat), _ curves: [(CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat)]) -> NSBezierPath {
+        let p = NSBezierPath()
+        p.move(to: pt(start.0, start.1))
+        for c in curves { p.curve(to: pt(c.4, c.5), controlPoint1: pt(c.0, c.1), controlPoint2: pt(c.2, c.3)) }
+        p.close()
+        return p
     }
-    gauge(radius: s * 0.25, width: s * 0.065, fraction: 0.72, color: NSColor(claudeAccent))
-    gauge(radius: s * 0.155, width: s * 0.065, fraction: 0.42, color: NSColor(codexAccent))
-    NSColor.white.withAlphaComponent(0.9).setFill()
-    NSBezierPath(ovalIn: NSRect(x: c.x - s * 0.03, y: c.y - s * 0.03, width: s * 0.06, height: s * 0.06)).fill()
+    let flame = path((0.50, 0.04), [
+        (0.27, 0.04, 0.12, 0.22, 0.14, 0.42),   // left belly
+        (0.16, 0.58, 0.26, 0.66, 0.29, 0.78),   // up to the left tongue
+        (0.36, 0.70, 0.41, 0.66, 0.45, 0.64),   // into the notch
+        (0.44, 0.78, 0.53, 0.90, 0.63, 0.98),   // up to the main tip
+        (0.67, 0.86, 0.75, 0.77, 0.80, 0.66),   // right shoulder
+        (0.88, 0.52, 0.89, 0.40, 0.86, 0.30),
+        (0.80, 0.13, 0.67, 0.04, 0.50, 0.04),
+    ])
+    NSGraphicsContext.saveGraphicsState()
+    let shadow = NSShadow()
+    shadow.shadowColor = rgb(0xFF4A1A, 0.55)
+    shadow.shadowBlurRadius = s * 0.06
+    shadow.set()
+    NSGradient(colors: [rgb(0xFFB02E), rgb(0xFF6A1F), rgb(0xF2372B)], atLocations: [0, 0.45, 1], colorSpace: .sRGB)?
+        .draw(in: flame, angle: 90)
+    NSGraphicsContext.restoreGraphicsState()
+
+    let core = path((0.50, 0.10), [
+        (0.36, 0.10, 0.27, 0.21, 0.28, 0.35),
+        (0.29, 0.48, 0.41, 0.55, 0.50, 0.68),
+        (0.58, 0.55, 0.72, 0.48, 0.72, 0.35),
+        (0.72, 0.21, 0.64, 0.10, 0.50, 0.10),
+    ])
+    NSGradient(starting: rgb(0xFFF1A8), ending: rgb(0xFFC23D))?.draw(in: core, angle: 90)
+
+    // Face: two eyes with a highlight, and a small smile.
+    for x in [0.42, 0.58] as [CGFloat] {
+        let e = pt(x, 0.31), w = box.width * 0.058, h = box.height * 0.085
+        rgb(0x3A1408).setFill()
+        NSBezierPath(ovalIn: NSRect(x: e.x - w / 2, y: e.y - h / 2, width: w, height: h)).fill()
+        NSColor.white.withAlphaComponent(0.9).setFill()
+        NSBezierPath(ovalIn: NSRect(x: e.x - w * 0.05, y: e.y + h * 0.08, width: w * 0.36, height: w * 0.36)).fill()
+    }
+    let smile = NSBezierPath()
+    smile.move(to: pt(0.455, 0.225))
+    smile.curve(to: pt(0.545, 0.225), controlPoint1: pt(0.475, 0.18), controlPoint2: pt(0.525, 0.18))
+    smile.lineWidth = box.width * 0.022
+    smile.lineCapStyle = .round
+    rgb(0x3A1408).setStroke()
+    smile.stroke()
+
     NSGraphicsContext.restoreGraphicsState()
     return rep
 }
@@ -752,7 +791,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         if title.length == 0 {   // both hidden: keep a clickable glyph
             let att = NSTextAttachment()
-            att.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "Burny")
+            att.image = NSImage(systemSymbolName: "flame", accessibilityDescription: "Burny")
             title.append(NSAttributedString(attachment: att))
         }
         item.button?.attributedTitle = title
@@ -797,12 +836,18 @@ if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
         if args.contains("en") { lang = "en" } else if args.contains("it") { lang = "it" }
         store.reloadLocal()
         if let l = fetchClaudeUsage() { store.claude = Service(name: "Claude Code", plan: claudePlan(), limits: l, updated: Date()) }
+        // Menu bar values, for the README composer: "<claude> <codex>"
+        print([store.claude, store.codex].map { store.barValue($0).map { "\(Int($0.rounded()))%" } ?? "–" }.joined(separator: " "))
         let host = NSHostingView(rootView: UsageView(store: store, settings: args.contains("settings")))
         host.frame.size = host.fittingSize
         let win = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
         win.appearance = NSAppearance(named: args.contains("dark") ? .darkAqua : .aqua)
+        win.backgroundColor = .windowBackgroundColor
         win.contentView = host
-        host.layoutSubtreeIfNeeded()
+        for _ in 0..<3 {   // re-measure until stable once the view sits in a window with its appearance
+            host.frame.size = host.fittingSize
+            host.layoutSubtreeIfNeeded()
+        }
         host.display()
         if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
             host.cacheDisplay(in: host.bounds, to: rep)

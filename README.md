@@ -1,32 +1,21 @@
 <p align="center">
-  <img src="docs/icon.png" width="128" alt="Burny icon">
-</p>
-
-<h1 align="center">Burny</h1>
-
-<p align="center">
-  <b>See how fast you are burning through your AI plan.</b><br>
-  Your Claude Code and Codex plan limits, live in the macOS menu bar.
+  <img src="docs/hero.png" alt="Burny: your Claude Code and Codex plan limits in the macOS menu bar">
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-13%2B-black?logo=apple" alt="macOS 13+">
   <img src="https://img.shields.io/badge/Swift-single%20file-F05138?logo=swift&logoColor=white" alt="Swift">
-  <img src="https://img.shields.io/badge/RAM-~12%20MB-2ea44f" alt="~12 MB RAM">
+  <img src="https://img.shields.io/badge/RAM-~13%20MB-2ea44f" alt="~13 MB RAM">
   <img src="https://img.shields.io/badge/network%20calls-none-2ea44f" alt="No network calls">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
 </p>
 
-<p align="center">
-  <img src="docs/menubar.png" height="24" alt="Menu bar">
-</p>
+# Burny
+
+**See how fast you're burning through your AI plan.** Burny sits in your menu bar and shows how much of your Claude Code and Codex limits you've used, and whether you're going too fast.
 
 <p align="center">
-  <img src="docs/popover-light.png" width="300" alt="Popover, light">
-  &nbsp;
-  <img src="docs/popover-dark.png" width="300" alt="Popover, dark">
-  &nbsp;
-  <img src="docs/settings-dark.png" width="300" alt="Settings">
+  <img src="docs/screens.png" alt="Light, dark and settings">
 </p>
 
 ## Features
@@ -36,7 +25,7 @@
 - **Pace marker.** The tick on each bar shows where you'd be if you spread usage evenly across the window. Ahead of the tick means you're burning fast.
 - **Reset countdowns.** "Resets in 4h 12m · 00:39" for every window.
 - **Settings.** Open at login, show or hide each service, choose which limit the bar shows, % used or % left, refresh interval, and English or Italian.
-- **Tiny.** One Swift file with no dependencies: ~290 KB binary, ~12 MB RAM, 0% CPU at idle.
+- **Tiny.** One Swift file with no dependencies: ~290 KB binary, ~13 MB RAM, 0% CPU at idle.
 
 ## Install
 
@@ -79,6 +68,7 @@ Because it only uses the vendors' own clients and files they already write on yo
 swiftc -Osize Sources/main.swift -o /tmp/burny
 /tmp/burny --snapshot out.png dark en     # render the popover (add: settings, it)
 /tmp/burny --icon icon.png 1024           # render the app icon
+./scripts/screenshots.sh                    # regenerate the README images from your live limits
 ```
 
 Adding a language means adding a string table next to `italian` in `Sources/main.swift`.
