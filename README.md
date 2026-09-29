@@ -24,7 +24,7 @@
 - **Every limit your plan has.** Claude Code: 5-hour session, weekly (all models) and per-model weekly buckets such as Fable. Codex: 5-hour session and weekly.
 - **Glanceable menu bar.** App icon plus the limit closest to running out, turning orange at 75% and red at 90%.
 - **Pace marker.** The tick on each bar shows where you'd be if you spread usage evenly across the window. Ahead of the tick means you're burning fast.
-- **Burn forecast.** "Runs out ~18:40 at this pace" whenever your current pace would hit the limit before it resets.
+- **Burn forecast.** It says when a limit runs out, but only when that's likely. Sessions use the last 30 minutes and look one hour ahead ("Runs out ~18:40 at this pace"). Weeks use the average since the window opened and name the day ("At this week's pace it runs out ~Friday"). The rules were tuned by replaying ten weeks of real usage.
 - **Reset countdowns.** "Resets in 4h 12m · 00:40" for every window.
 - **Alerts** at 80% and 90% (optional), once per limit and window, plus a "you're good to go" alert when a limit you'd nearly used up resets.
 - **Daily budget.** On weekly limits: how much you can use per day and still last until the reset.

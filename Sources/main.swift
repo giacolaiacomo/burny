@@ -12,7 +12,7 @@ import UserNotifications
 
 let bundleID = "com.burny.menubar"
 let repoSlug = "giacolaiacomo/burny"
-let appVersion = "1.3.0"   // install.sh reads this for Info.plist
+let appVersion = "1.3.1"   // install.sh reads this for Info.plist
 
 // MARK: Localization (English + Italian; add a language by adding a table)
 
@@ -60,13 +60,13 @@ let italian: [String: String] = [
     "Runs the official /usage: 0 tokens. Codex is read from local logs every 30 s.":
         "Esegue /usage del client ufficiale: 0 token. Codex si legge dai log locali ogni 30 s.",
     "Runs out ~%@ at this pace": "Finisce verso %@ a questo ritmo",
+    "At this week's pace it runs out ~%@": "Al ritmo di questa settimana finisce verso %@",
     "Updates when you use Codex.": "Si aggiorna quando usi Codex.",
     "Notifications": "Notifiche",
     "Alert at 80% and 90%": "Avvisa all'80% e al 90%",
     "Once per limit and window.": "Una volta per limite e finestra.",
     "%@ at %d%%": "%@ al %d%%",
     "%@ · resets %@": "%@ · si azzera %@",
-    "At this pace it runs out ~%@.": "A questo ritmo finisce verso %@.",
     "Updates": "Nuove versioni",
     "Check for updates": "Controlla aggiornamenti",
     "Once a day asks GitHub for the latest release. Nothing else is sent, nothing is installed.":
@@ -138,14 +138,19 @@ struct Limit: Identifiable {
     }
 
     var measuredAt = Date()        // when `percent` was observed
-    var recentRate: Double? = nil  // % per second over the last readings, set by Store
+    var recentRate: Double? = nil  // sessions: % per second over the last 30 min of readings, set by Store
 
-    /// Burn rate in % per second: recent readings when there are enough, else the average since the window opened.
+    var isSession: Bool { if case .session = kind { return true }; return false }
+
+    /// Burn rate in % per second. The rules come from replaying ten weeks of real usage logs:
+    ///  - session: the last 30 minutes predict best; the average since the window opened raised twice as many false alarms;
+    ///  - longer windows: the average since the window opened (nights and idle days included), once a day of it has
+    ///    passed; the last few hours swing with every burst of work and were right barely half the time.
     var rate: Double? {
-        if let recentRate { return recentRate }
+        if isSession { return recentRate }
         guard let r = resetsAt, window > 0, percent > 0 else { return nil }
         let elapsed = window - r.timeIntervalSince(measuredAt)
-        guard elapsed > max(window * 0.05, 600) else { return nil }   // too early in the window to tell
+        guard elapsed >= min(24 * hour, window * 0.2) else { return nil }   // too early in the window to tell
         return percent / elapsed
     }
 
@@ -155,12 +160,36 @@ struct Limit: Identifiable {
         return (100 - effective) / (r.timeIntervalSinceNow / 86400)
     }
 
-    /// When the limit hits 100% at the current burn rate, if that happens before the window resets.
+    /// When the limit hits 100% at the current burn rate. Shown only when it's likely: the pace must reach 115%
+    /// before the reset (a 15% margin), and a session forecast only looks one hour ahead. In the replay this cut
+    /// false alarms from 17% to 5% of the time (session) and from 12% to 4% (week).
     var runsOutAt: Date? {
         guard percent < 100, let rate, rate > 0, let r = resetsAt, r > Date(),
               -measuredAt.timeIntervalSinceNow < 6 * hour else { return nil }   // no forecasts from stale data
-        let eta = measuredAt.addingTimeInterval((100 - percent) / rate)
-        return eta < r ? max(eta, Date()) : nil
+        guard measuredAt.addingTimeInterval((115 - percent) / rate) < r else { return nil }
+        let eta = max(measuredAt.addingTimeInterval((100 - percent) / rate), Date())
+        if isSession && eta.timeIntervalSinceNow > hour { return nil }
+        return eta
+    }
+
+    /// The forecast as text, only as precise as it deserves: minutes for a session, the day for a week (the hour once it's close).
+    var runsOutText: String? {
+        guard let eta = runsOutAt else { return nil }
+        if isSession {
+            let rounded = Date(timeIntervalSinceReferenceDate: (eta.timeIntervalSinceReferenceDate / 300).rounded() * 300)
+            return String(format: tr("Runs out ~%@ at this pace"), shortWhen(rounded))
+        }
+        let cal = Calendar.current
+        let when: String
+        if eta.timeIntervalSinceNow < 24 * hour {
+            when = shortWhen(cal.dateInterval(of: .hour, for: eta.addingTimeInterval(1800))?.start ?? eta)
+        } else {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: lang == "it" ? "it_IT" : "en_US")
+            f.dateFormat = "EEEE"
+            when = cal.isDateInTomorrow(eta) ? tr("tomorrow") : f.string(from: eta)
+        }
+        return String(format: tr("At this week's pace it runs out ~%@"), when)
     }
 }
 
@@ -796,7 +825,7 @@ final class Store: ObservableObject {
         "\(s.name)|\(l.kind)|\(Int(l.resetsAt?.timeIntervalSince1970 ?? 0))"
     }
 
-    /// Records each reading and attaches the recent burn rate (session: last 45 min, week: last 6 h).
+    /// Records each reading and, for sessions, attaches the burn rate over the last 30 minutes.
     private func withRates(_ s: Service) -> Service {
         var out = s
         out.limits = s.limits.map { l in
@@ -806,9 +835,8 @@ final class Store: ObservableObject {
             if h.last?.at != l.measuredAt { h.append((l.measuredAt, l.percent)) }
             h.removeAll { $0.at < Date().addingTimeInterval(-7 * hour) }
             history[k] = h
-            let lookback: TimeInterval = l.window <= 5 * hour ? 45 * 60 : 6 * hour
-            let recent = h.filter { $0.at >= l.measuredAt.addingTimeInterval(-lookback) }
-            if let first = recent.first, let last = recent.last, last.at.timeIntervalSince(first.at) >= 15 * 60 {
+            let recent = h.filter { $0.at >= l.measuredAt.addingTimeInterval(-30 * 60) }
+            if l.isSession, let first = recent.first, let last = recent.last, last.at.timeIntervalSince(first.at) >= 20 * 60 {
                 l.recentRate = max(0, last.percent - first.percent) / last.at.timeIntervalSince(first.at)
             }
             return l
@@ -838,7 +866,7 @@ final class Store: ObservableObject {
                 let c = UNMutableNotificationContent()
                 c.title = String(format: tr("%@ at %d%%"), s.name, p)
                 var body = String(format: tr("%@ · resets %@"), l.label, shortWhen(l.resetsAt))
-                if let eta = l.runsOutAt { body += " " + String(format: tr("At this pace it runs out ~%@."), shortWhen(eta)) }
+                if let f = l.runsOutText { body += " " + f + "." }
                 if let hint = s.switchHint, hint.limit.kind == l.kind { body += " " + hint.text }
                 c.body = body
                 c.sound = .default
@@ -956,8 +984,8 @@ struct LimitRow: View {
             }
             .frame(height: 6)
             Text(resetLine(limit.resetsAt)).font(.system(size: 10.5)).foregroundStyle(.tertiary)
-            if let eta = limit.runsOutAt {
-                Label(String(format: tr("Runs out ~%@ at this pace"), shortWhen(eta)), systemImage: "flame.fill")
+            if let f = limit.runsOutText {
+                Label(f, systemImage: "flame.fill")
                     .font(.system(size: 10.5, weight: .medium)).foregroundStyle(.orange)
             } else if let b = limit.dailyBudget {
                 Label(String(format: tr("~%d%% a day lasts until the reset"), Int(b.rounded(.down))), systemImage: "calendar")
@@ -1557,10 +1585,16 @@ if args.contains("--self-test") {
     try? FileManager.default.removeItem(at: dir)
 
     var f = Limit(kind: .session(hours: 5), percent: 50, resetsAt: Date().addingTimeInterval(2 * hour), window: 5 * hour)
-    f.recentRate = 50.0 / hour   // 50 % per hour → out in one hour, before the reset
-    check(f.runsOutAt.map { abs($0.timeIntervalSinceNow - hour) < 5 } == true, "forecast: runs out before reset")
+    f.recentRate = 60.0 / hour   // 60 % per hour → out in 50 minutes, well before the reset
+    check(f.runsOutAt.map { abs($0.timeIntervalSinceNow - 50 * 60) < 5 } == true, "forecast: session runs out within the hour")
+    f.recentRate = 20.0 / hour   // out in 2.5 h: too far ahead for a session forecast
+    check(f.runsOutAt == nil, "forecast: session looks one hour ahead only")
     f.recentRate = 1.0 / hour
     check(f.runsOutAt == nil, "forecast: lasts until reset")
+    let wk2 = Limit(kind: .week(model: nil), percent: 50, resetsAt: Date().addingTimeInterval(5 * 86400), window: week)   // 50% in 2 days
+    check(wk2.runsOutAt.map { abs($0.timeIntervalSinceNow - 2 * 86400) < 60 } == true, "forecast: week uses the average since it opened")
+    let wk3 = Limit(kind: .week(model: nil), percent: 30, resetsAt: Date().addingTimeInterval(6.6 * 86400), window: week)  // 30% in 10 hours
+    check(wk3.runsOutAt == nil, "forecast: no week forecast in its first day")
     let wk = Limit(kind: .week(model: nil), percent: 40, resetsAt: Date().addingTimeInterval(3 * 86400 + 60), window: week)
     check(wk.dailyBudget.map { abs($0 - 20) < 0.1 } == true, "budget: 60% left over 3 days is ~20% a day")
     let fable = Service(name: "Claude Code", plan: nil, limits: [

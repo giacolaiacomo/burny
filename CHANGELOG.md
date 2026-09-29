@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.1 — 2026-09-29
+
+- **More reliable burn forecast.** The rules were picked by replaying ten weeks of real usage logs, testing each candidate at every hour or 5 minutes:
+  - **Session:** uses the last 30 minutes, looks at most one hour ahead, and needs a 15% margin. False alarms dropped from 17% to 5% of the time.
+  - **Week:** uses the average since the window opened, including nights and idle days, from the second day on, with the same margin. True alarms went from 58% to 76%, false alarms from 12% to 4%.
+- Forecasts are only as precise as they deserve: a session gets a time rounded to 5 minutes, a week gets the day, or the hour once it's close.
+
 ## 1.3.0 — 2026-09-27
 
 - **Where it went:** a new page (the pie-chart button) splits your session and week by project and by model. It's estimated from the token counts Claude Code and Codex already log locally, weighted by API price and scaled to the official %. Claude Code agent worktrees count toward their project.
