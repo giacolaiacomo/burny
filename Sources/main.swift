@@ -12,7 +12,7 @@ import UserNotifications
 
 let bundleID = "com.burny.menubar"
 let repoSlug = "giacolaiacomo/burny"
-let appVersion = "1.3.1"   // install.sh reads this for Info.plist
+let appVersion = "1.4.0"   // install.sh reads this for Info.plist
 
 // MARK: Localization (English + Italian; add a language by adding a table)
 
@@ -676,6 +676,8 @@ struct Breakdown {
     var bySession: [UsagePart] = []
     var byWeek: [UsagePart] = []
 
+    init(bySession: [UsagePart], byWeek: [UsagePart]) { self.bySession = bySession; self.byWeek = byWeek }
+
     /// `windows`: per service, the start of the current session and week and their official % used.
     init(_ ledger: UsageLedger, windows: [(service: String, session: (Date, Double?), week: (Date, Double?))]) {
         for w in windows {
@@ -697,6 +699,10 @@ struct Breakdown {
 
 enum LoginItem {
     static var domain: String { "gui/\(getuid())" }
+    /// install.sh writes com.burny.menubar; `brew services` writes sh.brew.burny (homebrew.mxcl.burny on older Homebrew).
+    static let labels = [bundleID, "sh.brew.burny", "homebrew.mxcl.burny"]
+    static func plist(_ label: String) -> URL { home.appendingPathComponent("Library/LaunchAgents/\(label).plist") }
+    static var label: String? { labels.first { FileManager.default.fileExists(atPath: plist($0).path) } }
 
     @discardableResult
     static func launchctl(_ args: [String]) -> String {
@@ -712,13 +718,24 @@ enum LoginItem {
     }
 
     static var isEnabled: Bool {
-        let plist = home.appendingPathComponent("Library/LaunchAgents/\(bundleID).plist")
-        guard FileManager.default.fileExists(atPath: plist.path) else { return false }
+        guard let label else { return false }
         let disabled = launchctl(["print-disabled", domain])
-        return !disabled.contains("\"\(bundleID)\" => disabled") && !disabled.contains("\"\(bundleID)\" => true")
+        return !disabled.contains("\"\(label)\" => disabled") && !disabled.contains("\"\(label)\" => true")
     }
 
-    static func set(_ on: Bool) { launchctl([on ? "enable" : "disable", "\(domain)/\(bundleID)"]) }
+    static func set(_ on: Bool) {
+        if on && label == nil { writeAgent() }
+        launchctl([on ? "enable" : "disable", "\(domain)/\(label ?? bundleID)"])
+    }
+
+    /// For a copy installed without install.sh or `brew services`: a LaunchAgent that starts this copy at the next login.
+    static func writeAgent() {
+        guard var exe = Bundle.main.executablePath else { return }
+        if let r = exe.range(of: #"/Cellar/burny/[^/]+/"#, options: .regularExpression) { exe.replaceSubrange(r, with: "/opt/burny/") }   // survives brew upgrades
+        let agent: [String: Any] = ["Label": bundleID, "ProgramArguments": [exe], "RunAtLoad": true, "KeepAlive": ["SuccessfulExit": false]]
+        try? FileManager.default.createDirectory(at: plist(bundleID).deletingLastPathComponent(), withIntermediateDirectories: true)
+        (agent as NSDictionary).write(to: plist(bundleID), atomically: true)
+    }
 }
 
 // MARK: Store
@@ -779,8 +796,10 @@ final class Store: ObservableObject {
         }
     }
 
+    var demo = false   // made-up data for images: don't replace it with the real logs
+
     func loadBreakdown() {
-        guard !readingLogs else { return }
+        guard !readingLogs, !demo else { return }
         readingLogs = true
         let windows = usageWindows()
         DispatchQueue.global(qos: .utility).async {
@@ -1108,6 +1127,15 @@ struct UsageView: View {
     }
 }
 
+func dollars(_ v: Double) -> String {
+    let f = NumberFormatter()
+    f.locale = Locale(identifier: "en_US")
+    f.numberStyle = .decimal
+    f.minimumFractionDigits = v < 100 ? 2 : 0
+    f.maximumFractionDigits = v < 100 ? 2 : 0
+    return f.string(from: NSNumber(value: v)) ?? String(format: "%.0f", v)
+}
+
 func tokenCount(_ t: Double) -> String {
     t >= 1e9 ? String(format: "%.1fB", t / 1e9) : t >= 1e6 ? String(format: "%.1fM", t / 1e6) : t >= 1e3 ? String(format: "%.0fK", t / 1e3) : String(Int(t))
 }
@@ -1169,7 +1197,7 @@ struct PartCard: View {
                 Text(part.service).font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if part.service == "Claude Code" && part.cost > 0 {
-                    Text(String(format: tr("≈ $%@ at API prices"), String(format: "%.2f", part.cost)))
+                    Text(String(format: tr("≈ $%@ at API prices"), dollars(part.cost)))
                         .font(.system(size: 10.5)).foregroundStyle(.secondary)
                         .help(tr("What the same usage would cost on the API, at list prices."))
                 }
@@ -1539,7 +1567,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 //
 // Dev helpers:  --self-test                                checks the parsers (run by CI)
 //               --icon out.png [px]                        renders the app icon
-//               --snapshot out.png [dark] [settings|breakdown] [en|it]  renders the popover with live data
+//               --snapshot out.png [dark] [settings|breakdown] [en|it] [demo]  renders the popover (live or made-up data)
 //               --usage-log [days]                         prints the per-project split of the local logs
 
 let args = CommandLine.arguments
@@ -1659,15 +1687,58 @@ if let i = args.firstIndex(of: "--icon"), i + 1 < args.count {
     exit(0)
 }
 
+/// Made-up, realistic data for the README images and launch material, so real project names never leak into them.
+func loadDemo(_ store: Store) {
+    store.demo = true
+    let now = Date()
+    func at(_ h: Double) -> Date { now.addingTimeInterval(h * hour) }
+    var session = Limit(kind: .session(hours: 5), percent: 42, resetsAt: at(2.3), window: 5 * hour)
+    session.recentRate = 70 / hour   // shows the session forecast
+    store.claude = Service(name: "Claude Code", plan: "Max 5x", limits: [
+        session,
+        Limit(kind: .week(model: "all models"), percent: 58, resetsAt: at(76), window: week),
+        Limit(kind: .week(model: "Fable"), percent: 92, resetsAt: at(76), window: week),
+    ], updated: now)
+    store.codex = Service(name: "Codex", plan: "Plus", limits: [
+        Limit(kind: .session(hours: 5), percent: 18, resetsAt: at(3.7), window: 5 * hour),
+        Limit(kind: .week(model: nil), percent: 31, resetsAt: at(122), window: week),
+    ], updated: now.addingTimeInterval(-12 * 60))
+    func part(_ service: String, _ percent: Double, _ cost: Double, _ tokens: Double, _ projects: [(String, Double)],
+              _ models: [(String, Double)], previous: Double? = nil, daily: [Double] = []) -> UsagePart {
+        var p = UsagePart(service: service, percent: percent, cost: cost, tokens: tokens,
+                          projects: projects.map { ($0.0, $0.1 * cost) }, models: models.map { ($0.0, $0.1 * cost) },
+                          previous: previous, daily: daily)
+        p.windowDays = 4
+        return p
+    }
+    store.breakdown = Breakdown(
+        bySession: [
+            part("Claude Code", 42, 96.4, 2.1e8, [("acme-web", 0.58), ("api-server", 0.31), ("docs-site", 0.11)], [("Opus 5.5", 0.7), ("Fable 5.1", 0.3)]),
+            part("Codex", 18, 0.9, 6.2e6, [("mobile-app", 1)], [("GPT-6 Astra", 1)]),
+        ],
+        byWeek: [
+            part("Claude Code", 58, 1284.5, 2.9e9,
+                 [("acme-web", 0.40), ("api-server", 0.24), ("mobile-app", 0.15), ("docs-site", 0.08), ("infra", 0.05), ("playground", 0.03), ("scratch", 0.05)],
+                 [("Opus 5.5", 0.64), ("Fable 5.1", 0.26), ("Sonnet 5", 0.10)], previous: 1052,
+                 daily: [120, 180, 60, 0, 0, 210, 240, 150, 90, 0, 310, 420, 360, 195]),
+            part("Codex", 31, 3.1, 1.8e7, [("mobile-app", 0.62), ("api-server", 0.38)], [("GPT-6 Astra", 0.8), ("GPT-6 Luna", 0.2)],
+                 previous: 2.6, daily: [0, 0.2, 0.4, 0, 0, 0.3, 0.1, 0, 0.5, 0.2, 0.9, 0.6, 0.7, 0.2]),
+        ])
+}
+
 if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
     MainActor.assumeIsolated {
         let store = Store()
         if args.contains("en") { lang = "en" } else if args.contains("it") { lang = "it" }
-        store.reloadLocal()
-        if let l = fetchClaudeUsage() { store.claude = Service(name: "Claude Code", plan: claudePlan(), limits: l, updated: Date()) }
+        if args.contains("demo") {
+            loadDemo(store)
+        } else {
+            store.reloadLocal()
+            if let l = fetchClaudeUsage() { store.claude = Service(name: "Claude Code", plan: claudePlan(), limits: l, updated: Date()) }
+        }
         // Menu bar values, for the README composer: "<claude> <codex>"
         print([store.claude, store.codex].map { store.barValue($0).map { "\(Int($0.rounded()))%" } ?? "–" }.joined(separator: " "))
-        if args.contains("breakdown") {
+        if args.contains("breakdown") && !args.contains("demo") {
             let ledger = UsageLedger()
             ledger.update()
             store.breakdown = Breakdown(ledger, windows: store.usageWindows())

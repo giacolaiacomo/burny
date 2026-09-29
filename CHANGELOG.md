@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.0 — 2026-09-29
+
+- **Homebrew:** `brew install giacolaiacomo/tap/burny`, then `brew services start burny`. It is still built from source on your Mac.
+- **Open at login** now works however Burny was installed: with install.sh, with `brew services`, or by just opening the app.
+- **Demo mode** for images (`--snapshot … demo`). The README images and the new animation use made-up data, so no real project names appear in them.
+- `scripts/build-app.sh` builds the app bundle for both install.sh and Homebrew.
+
 ## 1.3.1 — 2026-09-29
 
 - **More reliable burn forecast.** The rules were picked by replaying ten weeks of real usage logs, testing each candidate at every hour or 5 minutes:

@@ -37,7 +37,7 @@ If you turn on **Check for updates**, Burny sends at most one request a day to `
 - Contact Anthropic or OpenAI itself, or make any network request other than the optional update check above.
 - Read, copy or forward OAuth tokens, API keys, cookies or Keychain items.
 - Call private or undocumented endpoints.
-- Send telemetry, or write anything outside `~/Library/Preferences/com.burny.menubar.plist` and `~/Library/Caches/Burny`.
+- Send telemetry, or write anything outside `~/Library/Preferences/com.burny.menubar.plist`, `~/Library/Caches/Burny` and, when you turn on **Open at login**, its LaunchAgent in `~/Library/LaunchAgents/`.
 
 The whole app is one ~1,700-line file, [`Sources/main.swift`](Sources/main.swift), so you can read all of it before you build it. You always build it from source yourself; no prebuilt binaries are distributed.
 

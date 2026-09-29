@@ -16,8 +16,14 @@
 **See how fast you're burning through your AI plan.** Burny sits in your menu bar and shows how much of your Claude Code and Codex limits you've used, and whether you're going too fast.
 
 <p align="center">
-  <img src="docs/screens.jpg" alt="Light, dark and settings">
+  <img src="docs/demo.gif" width="800" alt="Opening Burny from the menu bar, then the Where it went page">
 </p>
+
+<p align="center">
+  <img src="docs/screens.jpg" alt="Limits, the Where it went breakdown, and settings">
+</p>
+
+<sub>Images use made-up demo data.</sub>
 
 ## Features
 
@@ -35,7 +41,18 @@
 
 ## Install
 
-You need macOS 13+ and the Swift toolchain (`xcode-select --install`).
+You need macOS 13+ and the Swift toolchain (`xcode-select --install`). Either way, Burny is built from source on your Mac.
+
+**Homebrew**
+
+```sh
+brew install giacolaiacomo/tap/burny
+brew services start burny     # start now and at every login
+```
+
+To update: `brew upgrade burny`. To remove it: `brew services stop burny && brew uninstall burny`.
+
+**From source**
 
 ```sh
 git clone https://github.com/giacolaiacomo/burny.git
@@ -43,7 +60,7 @@ cd burny
 ./install.sh
 ```
 
-This builds `~/Applications/Burny.app` and registers it to start at login. To remove it: `./uninstall.sh`.
+This builds `~/Applications/Burny.app` and registers it to start at login. To update: `git pull && ./install.sh`. To remove it: `./uninstall.sh`.
 
 ## How it gets the data, and why it's safe
 
@@ -75,10 +92,10 @@ Because it only uses the vendors' own clients and files they already write on yo
 ```sh
 swiftc -Osize Sources/main.swift -o /tmp/burny
 /tmp/burny --self-test                      # parser and forecast checks (also run in CI)
-/tmp/burny --snapshot out.png dark en     # render the popover (add: settings or breakdown, it)
+/tmp/burny --snapshot out.png dark en     # render the popover (add: settings or breakdown, it, demo)
 /tmp/burny --usage-log 7                    # print the per-project split of the last 7 days
 /tmp/burny --icon icon.png 1024           # render the app icon
-./scripts/screenshots.sh                    # regenerate the README images from your live limits
+./scripts/screenshots.sh                    # regenerate the README images and animation (demo data; needs ffmpeg)
 ```
 
 Adding a language means adding a string table next to `italian` in `Sources/main.swift`.
