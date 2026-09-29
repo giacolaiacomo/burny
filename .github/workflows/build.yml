@@ -15,3 +15,5 @@ jobs:
         run: ./burny --self-test
       - name: Smoke test (render the app icon)
         run: ./burny --icon icon.png 256 && test -s icon.png
+      - name: App bundle (the same script Homebrew and install.sh use)
+        run: ./scripts/build-app.sh build/Burny.app && test -x build/Burny.app/Contents/MacOS/Burny && test -s build/Burny.app/Contents/Resources/AppIcon.icns
